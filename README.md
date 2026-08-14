@@ -39,7 +39,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 | Step | What it adds | Done |
 |------|--------------|:----:|
 | 1 | Repo skeleton, Maven build, GTFS-Realtime protobuf decoding | ✅ |
-| 2 | Domain model, scheduled polling, rate limiting, idempotent dedupe | ☐ |
+| 2 | Scheduled polling, rate limiting, idempotent concurrent store | ✅ |
 | 3 | Kafka in Docker + keyed producer | ☐ |
 | 4 | Bounded queue, backpressure, virtual threads, Micrometer metrics | ☐ |
 | 5 | Static GTFS ingest (routes, trips, shapes) + Guava LoadingCache | ☐ |
@@ -72,7 +72,7 @@ Run the tests:
 mvnw -B test
 ```
 
-Fetch the live MARTA feed and print what's out there right now:
+Poll the live MARTA feed continuously and hold every bus in memory. Ctrl+C to stop:
 
 ```bash
 mvnw -q -pl headway-ingest -am package exec:java -DskipTests
@@ -81,18 +81,47 @@ mvnw -q -pl headway-ingest -am package exec:java -DskipTests
 Expected output (numbers vary — this is a live feed):
 
 ```
-Fetching https://gtfs-rt.itsmarta.com/TMGTFSRealTimeWebService/vehicle/vehiclepositions.pb
-Fetched 14848 bytes
-GTFS-RT version 2.0 | feed timestamp 2026-08-14T21:03:39Z (4s old)
-188 entities in feed -> 188 usable vehicle positions
-65 routes currently have vehicles reporting. Busiest 10:
-   route 121 -> 7 vehicles
-   route 15 -> 7 vehicles
-   ...
-   route 1 | vehicle 2380 | (33.78998, -84.40430) | 13.4 m/s | age 5s
+Starting ingest: poll every 15s, ceiling 0.0667 req/s, evict after 10min
+poll: 193 received | 193 new,   0 updated,   0 stale | 193 vehicles on 66 routes | 718ms
+poll: 193 received |   0 new,   0 updated, 193 stale | 193 vehicles on 66 routes |  33ms
+poll: 192 received |   0 new, 186 updated,   6 stale | 193 vehicles on 66 routes |  27ms
+poll: 192 received |   0 new,   0 updated, 192 stale | 193 vehicles on 66 routes |  28ms
+Evicted 5 stale vehicles; 188 remain
+poll: 191 received |   4 new, 184 updated,   3 stale | 192 vehicles on 66 routes |  37ms
 ```
 
+Reading that: the first poll is all new. Then **every other poll is 100% stale** — MARTA
+republishes roughly every 30 seconds, so a 15-second poll fetches the byte-identical file half the
+time. The idempotency check absorbs the whole duplicate batch and the store does not move.
+
+That is not a bug to tune away. Polling faster than the publish rate is deliberate: you do not know
+the publisher's phase, so the only way to see a new file promptly is to ask more often than it
+changes. The correctness property that makes it safe — a re-delivered message is a no-op — is the
+same one that will let you replay a Kafka topic from the beginning in step 3 without corrupting
+anything.
+
+The `Evicted 5` line is a separate thread sweeping out buses that finished their shift.
+
 Runs late at night will show far fewer vehicles. Zero vehicles is normal around 2–4 AM.
+
+## Concurrency notes
+
+The interesting parts, and where to read them:
+
+| Concern | Where | Approach |
+|---------|-------|----------|
+| Shared mutable state | [`VehicleStore`](headway-ingest/src/main/java/dev/headway/ingest/VehicleStore.java) | `ConcurrentHashMap.compute` — read-decide-write as one atomic step, avoiding a check-then-act race |
+| Idempotency / late data | `VehiclePosition.isSupersededBy` | Per-vehicle last-seen timestamp; older readings dropped |
+| Consistent reads | `VehicleStore.snapshot()` | Guava `ImmutableMap` copy, so readers never see a half-applied batch |
+| Contended counters | `VehicleStore` | `LongAdder`, not `AtomicLong` |
+| Unbounded growth | `VehicleStore.evictStale` | Vehicles silent for 10 minutes are swept |
+| Politeness to MARTA | [`FeedPoller`](headway-ingest/src/main/java/dev/headway/ingest/FeedPoller.java) | Guava `RateLimiter` as a hard ceiling, independent of the scheduler's cadence |
+| Scheduler survival | `FeedPoller.run()` | Catches `Throwable`; an escaping exception silently cancels a `scheduleWithFixedDelay` task forever |
+| Overload behaviour | [`IngestService`](headway-ingest/src/main/java/dev/headway/ingest/IngestService.java) | `scheduleWithFixedDelay`, not `AtFixedRate`, so slow responses never cause a thundering catch-up |
+| Clean shutdown | `IngestService.close()` | `shutdown` → `awaitTermination` → `shutdownNow` |
+
+The concurrency test in `VehicleStoreTest` is not decorative: the same workload run against a
+naive `get()`-then-`put()` implementation served a stale position on 5 of 40 runs.
 
 ## Module layout
 

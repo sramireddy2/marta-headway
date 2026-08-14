@@ -1,22 +1,22 @@
 package dev.headway.ingest;
 
-import com.google.transit.realtime.GtfsRealtime.FeedMessage;
 import dev.headway.common.VehiclePosition;
-import java.time.Duration;
-import java.time.Instant;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Step 1 entry point: fetch MARTA's live feed once, decode it, and print what is out there.
+ * Step 2 entry point: poll MARTA continuously and keep a live view of every bus in memory.
  *
- * <p>Run it with:
+ * <p>Run with:
  *
- * <pre>{@code mvnw -pl headway-ingest -am exec:java}</pre>
+ * <pre>{@code mvnw -q -pl headway-ingest -am package exec:java -DskipTests}</pre>
+ *
+ * <p>Press Ctrl+C to stop; the shutdown hook drains the executor cleanly.
  */
 public final class IngestMain {
 
@@ -25,45 +25,44 @@ public final class IngestMain {
     public static void main(String[] args) throws Exception {
         GtfsRealtimeClient client = new GtfsRealtimeClient(GtfsRealtimeClient.MARTA_VEHICLE_POSITIONS);
 
-        log.info("Fetching {}", client.feedUrl());
-        FeedMessage feed = client.fetch();
-        List<VehiclePosition> positions = GtfsRealtimeClient.toVehiclePositions(feed);
+        // In step 3 this lambda becomes "publish to Kafka". Wiring the seam in now means that
+        // change touches one line instead of restructuring the poller.
+        Consumer<List<VehiclePosition>> downstream =
+                positions -> log.debug("downstream received {} positions", positions.size());
 
-        Instant feedTime = Instant.ofEpochSecond(feed.getHeader().getTimestamp());
-        log.info("GTFS-RT version {} | feed timestamp {} ({} old)",
-                feed.getHeader().getGtfsRealtimeVersion(),
-                feedTime,
-                humanize(Duration.between(feedTime, Instant.now())));
-        log.info("{} entities in feed -> {} usable vehicle positions",
-                feed.getEntityCount(), positions.size());
+        IngestService service =
+                new IngestService(client, IngestService.Config.defaults(), downstream);
 
-        Map<String, Long> byRoute = positions.stream()
+        // A shutdown hook runs when the JVM is asked to exit: Ctrl+C, `kill`, IDE stop button.
+        // Without one, Ctrl+C kills the process mid-poll and (later) leaves Kafka messages
+        // unflushed. The latch lets main() park until then instead of spinning.
+        CountDownLatch shutdown = new CountDownLatch(1);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("Shutdown signal received.");
+            service.close();
+            printBusiestRoutes(service.store());
+            shutdown.countDown();
+        }, "headway-shutdown"));
+
+        service.start();
+        log.info("Ingest running. Ctrl+C to stop.");
+        shutdown.await();
+    }
+
+    /**
+     * Routes with the most vehicles are the ones most likely to be bunching. This is a crude
+     * preview of what step 7 computes properly, using distance along the route rather than a count.
+     */
+    private static void printBusiestRoutes(VehicleStore store) {
+        Map<String, Long> byRoute = store.snapshot().values().stream()
                 .collect(Collectors.groupingBy(VehiclePosition::routeId, Collectors.counting()));
 
-        log.info("{} routes currently have vehicles reporting. Busiest 10:", byRoute.size());
+        log.info("Final tally: {} vehicles across {} routes", store.size(), byRoute.size());
         byRoute.entrySet().stream()
                 .sorted(Map.Entry.<String, Long>comparingByValue().reversed()
                         .thenComparing(Map.Entry.comparingByKey()))
-                .limit(10)
-                .forEach(e -> log.info("   route {} -> {} vehicles", e.getKey(), e.getValue()));
-
-        log.info("Sample of 5 vehicles:");
-        positions.stream()
-                .sorted(Comparator.comparing(VehiclePosition::routeId)
-                        .thenComparing(VehiclePosition::vehicleId))
                 .limit(5)
-                .forEach(vp -> log.info("   route {} | vehicle {} | ({}, {}) | {} | age {}",
-                        vp.routeId(),
-                        vp.vehicleId(),
-                        "%.5f".formatted(vp.latitude()),
-                        "%.5f".formatted(vp.longitude()),
-                        vp.speed().isPresent() ? "%.1f m/s".formatted(vp.speed().getAsDouble()) : "no speed",
-                        humanize(Duration.between(vp.timestamp(), Instant.now()))));
-    }
-
-    private static String humanize(Duration d) {
-        long seconds = Math.max(0, d.toSeconds());
-        return seconds < 60 ? seconds + "s" : (seconds / 60) + "m" + (seconds % 60) + "s";
+                .forEach(e -> log.info("   route {} -> {} vehicles", e.getKey(), e.getValue()));
     }
 
     private IngestMain() {}

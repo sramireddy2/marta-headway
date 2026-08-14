@@ -33,7 +33,7 @@ import org.slf4j.LoggerFactory;
  * <p>This class is immutable and therefore thread-safe. {@link HttpClient} is itself thread-safe
  * and is designed to be shared — creating one per request would leak connection pools.
  */
-public final class GtfsRealtimeClient {
+public final class GtfsRealtimeClient implements VehicleFeed {
 
     private static final Logger log = LoggerFactory.getLogger(GtfsRealtimeClient.class);
 
@@ -137,6 +137,7 @@ public final class GtfsRealtimeClient {
     }
 
     /** Convenience: fetch and convert in one call. */
+    @Override
     public List<VehiclePosition> fetchVehiclePositions() throws IOException, InterruptedException {
         return toVehiclePositions(fetch());
     }

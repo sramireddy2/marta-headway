@@ -31,6 +31,7 @@
     <exec.mainClass>none</exec.mainClass>
 
     <gtfs.rt.bindings.version>0.2.0</gtfs.rt.bindings.version>
+    <guava.version>33.6.0-jre</guava.version>
     <slf4j.version>2.0.16</slf4j.version>
     <logback.version>1.5.12</logback.version>
     <junit.version>5.11.3</junit.version>
@@ -54,6 +55,12 @@
         <groupId>org.mobilitydata</groupId>
         <artifactId>gtfs-realtime-bindings</artifactId>
         <version>${gtfs.rt.bindings.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>com.google.guava</groupId>
+        <artifactId>guava</artifactId>
+        <version>${guava.version}</version>
       </dependency>
 
       <dependency>

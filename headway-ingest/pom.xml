@@ -32,6 +32,12 @@
       <artifactId>gtfs-realtime-bindings</artifactId>
     </dependency>
 
+    <!-- RateLimiter, ImmutableMap. More Guava arrives in later steps. -->
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+    </dependency>
+
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
