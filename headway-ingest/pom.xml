@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>dev.headway</groupId>
+    <artifactId>headway-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>headway-ingest</artifactId>
+  <name>Headway :: Ingest</name>
+  <description>Polls the GTFS-Realtime feed, decodes protobuf, produces domain objects.</description>
+
+  <properties>
+    <!-- This module *is* runnable, so it opts back in to exec:java. -->
+    <exec.skip>false</exec.skip>
+    <exec.mainClass>dev.headway.ingest.IngestMain</exec.mainClass>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>dev.headway</groupId>
+      <artifactId>headway-common</artifactId>
+    </dependency>
+
+    <!-- Generated Java classes for the GTFS-Realtime protobuf schema. -->
+    <dependency>
+      <groupId>org.mobilitydata</groupId>
+      <artifactId>gtfs-realtime-bindings</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ch.qos.logback</groupId>
+      <artifactId>logback-classic</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Lets us run the app with: mvn -pl headway-ingest exec:java -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

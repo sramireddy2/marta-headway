@@ -1,0 +1,30 @@
+# Maven build output
+target/
+
+# Maven wrapper: the scripts and .properties ARE committed on purpose (that is the
+# whole point of a wrapper), but the downloaded distribution is not.
+.mvn/wrapper/maven-wrapper.jar
+
+# IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and local data
+*.log
+logs/
+/data/
+
+# Secrets — never commit these
+.env
+*.local.properties

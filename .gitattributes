@@ -1,0 +1,15 @@
+# Normalise line endings so the repo is identical on Windows, macOS and Linux.
+* text=auto eol=lf
+
+# Windows batch files MUST keep CRLF or cmd.exe misparses them.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# The Unix wrapper MUST keep LF or /bin/sh reports "bad interpreter".
+mvnw text eol=lf
+
+# Binary: never touch, never diff.
+*.pb binary
+*.jar binary
+*.zip binary
+*.png binary
