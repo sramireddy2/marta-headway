@@ -58,24 +58,38 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 - **Docker Desktop** (from step 3 onward, for Kafka).
 - Nothing else. Maven is supplied by the wrapper (`mvnw` / `mvnw.cmd`), which downloads itself.
 
-Check your setup:
+### Set JAVA_HOME
+
+The Maven wrapper reads `JAVA_HOME`, and it must point at the JDK **folder** — not at
+`java.exe`, and not at a path that no longer exists. Check it:
 
 ```bash
-java -version
+echo $env:JAVA_HOME
+```
+
+If it is wrong, set it once (PowerShell), then **open a new terminal** — environment changes only
+apply to shells started afterwards:
+
+```bash
+[Environment]::SetEnvironmentVariable("JAVA_HOME","C:\Program Files\Eclipse Adoptium\jdk-21.0.9.10-hotspot","User")
 ```
 
 ## Build and run
 
+> **PowerShell users:** PowerShell will not run a script from the current directory without a
+> leading `.\`, and it needs the `.cmd` extension. Use `.\mvnw.cmd`. In Git Bash, macOS, or Linux
+> use `./mvnw` instead.
+
 Run the tests:
 
 ```bash
-mvnw -B test
+.\mvnw.cmd -B test
 ```
 
 Poll the live MARTA feed continuously and hold every bus in memory. Ctrl+C to stop:
 
 ```bash
-mvnw -q -pl headway-ingest -am package exec:java -DskipTests
+.\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests
 ```
 
 Expected output (numbers vary — this is a live feed):
