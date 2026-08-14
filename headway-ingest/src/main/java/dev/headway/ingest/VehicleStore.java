@@ -56,6 +56,20 @@ public final class VehicleStore {
 
     private static final Logger log = LoggerFactory.getLogger(VehicleStore.class);
 
+    /**
+     * How far into the future a timestamp may be before we refuse it.
+     *
+     * <p>Vehicle timestamps come from the bus, not the server, so a transponder with a drifting
+     * clock can report the future. A future-dated ping is uniquely poisonous: no real reading ever
+     * looks newer than it, so it can never be updated, and it never falls behind the eviction
+     * cutoff, so it can never be swept. It would sit in the store corrupting that route's headway
+     * until the process restarts.
+     *
+     * <p>A live sample of 185 MARTA vehicles contained none, so this is a guard against a failure
+     * that is rare but permanent and silent — the combination worth spending two lines on.
+     */
+    private static final Duration MAX_CLOCK_SKEW = Duration.ofMinutes(2);
+
     /** What happened to one incoming ping. */
     public enum Outcome {
         /** First time we have ever seen this vehicle. */
@@ -63,26 +77,56 @@ public final class VehicleStore {
         /** A strictly newer reading replaced the one we had. */
         UPDATED,
         /** A duplicate or out-of-order reading. Dropped. This is normal, not an error. */
-        STALE
+        STALE,
+        /** Older than {@code maxAge}, or implausibly future-dated. Never enters the store. */
+        REJECTED
     }
 
     private final ConcurrentHashMap<String, VehiclePosition> byVehicleId = new ConcurrentHashMap<>();
     private final Clock clock;
+    private final Duration maxAge;
 
     // LongAdder, not AtomicLong. Under contention AtomicLong has every thread compare-and-swapping
     // the same memory address, and they livelock each other. LongAdder keeps per-thread cells and
     // only sums them when you read. Write-heavy counters should always be LongAdder.
     private final LongAdder appliedCount = new LongAdder();
     private final LongAdder staleCount = new LongAdder();
+    private final LongAdder rejectedCount = new LongAdder();
     private final LongAdder evictedCount = new LongAdder();
 
-    public VehicleStore() {
-        this(Clock.systemUTC());
+    /**
+     * @param maxAge how stale a reading may be and still be usable. This one value governs
+     *     <em>both</em> admission and eviction — see {@link #isAdmissible}.
+     */
+    public VehicleStore(Duration maxAge) {
+        this(Clock.systemUTC(), maxAge);
     }
 
     /** The {@link Clock} is injected so tests can control "now" instead of sleeping. */
-    public VehicleStore(Clock clock) {
+    public VehicleStore(Clock clock, Duration maxAge) {
         this.clock = clock;
+        this.maxAge = maxAge;
+    }
+
+    /**
+     * Is this reading fresh enough to be worth storing?
+     *
+     * <p><b>Why this exists.</b> Eviction and admission must agree, and originally they did not.
+     * Eviction dropped anything older than {@code maxAge}, but {@code apply} would happily admit
+     * any vehicle id it had not seen — including one whose GPS froze an hour ago. A bus with a
+     * stuck transponder stays listed in the feed forever with an unchanging timestamp, so the
+     * observed behaviour was a loop: the sweep evicted it, the next poll re-added it as
+     * {@code NEW}, the next sweep evicted it again, once a minute, indefinitely.
+     *
+     * <p>Both rules now read the same {@code maxAge} off the same object with the same
+     * {@link Clock}, so the invariant holds by construction: <b>nothing can be admitted that the
+     * next sweep would immediately remove.</b> They cannot drift apart, because there is only one
+     * of them.
+     */
+    private boolean isAdmissible(VehiclePosition p) {
+        Instant now = clock.instant();
+        return !p.timestamp().isBefore(now.minus(maxAge))
+                && !p.timestamp().isAfter(now.plus(MAX_CLOCK_SKEW));
     }
 
     /**
@@ -91,6 +135,11 @@ public final class VehicleStore {
      * <p>Safe to call from any number of threads simultaneously.
      */
     public Outcome apply(VehiclePosition incoming) {
+        if (!isAdmissible(incoming)) {
+            rejectedCount.increment();
+            return Outcome.REJECTED;
+        }
+
         // We need to know which branch the lambda took. AtomicReference is the carrier.
         // This is safe specifically because compute() runs the function exactly once, under the
         // bin lock — it never retries it the way a compare-and-swap loop would.
@@ -120,21 +169,22 @@ public final class VehicleStore {
 
     /** Applies a whole feed's worth of pings and reports the tally. */
     public Stats applyAll(Iterable<VehiclePosition> positions) {
-        long fresh = 0, updated = 0, stale = 0;
+        long fresh = 0, updated = 0, stale = 0, rejected = 0;
         for (VehiclePosition p : positions) {
             switch (apply(p)) {
                 case NEW -> fresh++;
                 case UPDATED -> updated++;
                 case STALE -> stale++;
+                case REJECTED -> rejected++;
             }
         }
-        return new Stats(fresh, updated, stale);
+        return new Stats(fresh, updated, stale, rejected);
     }
 
     /** Tally for a single batch. */
-    public record Stats(long created, long updated, long stale) {
+    public record Stats(long created, long updated, long stale, long rejected) {
         public long total() {
-            return created + updated + stale;
+            return created + updated + stale + rejected;
         }
     }
 
@@ -163,15 +213,19 @@ public final class VehicleStore {
     }
 
     /**
-     * Forgets vehicles that have not reported for {@code maxAge}.
+     * Forgets vehicles that have not reported within {@code maxAge}.
      *
      * <p>Without this the map only ever grows. A bus that finishes its shift stops appearing in the
      * feed but never sends a "goodbye", so its last position would sit here forever, and step 7
      * would happily compute a headway against a bus that went home three hours ago.
      *
+     * <p>Takes no threshold argument on purpose: it uses the same {@code maxAge} that
+     * {@link #isAdmissible} enforces. Passing a different one at the call site is exactly how the
+     * two rules drifted apart in the first place.
+     *
      * @return how many were removed
      */
-    public int evictStale(Duration maxAge) {
+    public int evictStale() {
         Instant cutoff = clock.instant().minus(maxAge);
         int before = byVehicleId.size();
 
@@ -198,6 +252,10 @@ public final class VehicleStore {
         return staleCount.sum();
     }
 
+    public long rejectedTotal() {
+        return rejectedCount.sum();
+    }
+
     public long evictedTotal() {
         return evictedCount.sum();
     }
@@ -214,7 +272,8 @@ public final class VehicleStore {
 
     @Override
     public String toString() {
-        return "VehicleStore[vehicles=%d, routes=%d, applied=%d, stale=%d, evicted=%d]"
-                .formatted(size(), routeCount(), appliedTotal(), staleTotal(), evictedTotal());
+        return "VehicleStore[vehicles=%d, routes=%d, applied=%d, stale=%d, rejected=%d, evicted=%d]"
+                .formatted(size(), routeCount(), appliedTotal(), staleTotal(),
+                        rejectedTotal(), evictedTotal());
     }
 }

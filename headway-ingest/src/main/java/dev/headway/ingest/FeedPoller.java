@@ -108,8 +108,9 @@ public final class FeedPoller implements Runnable {
         long millis = (System.nanoTime() - startNanos) / 1_000_000;
         Result result = new Result(positions.size(), stats, millis);
 
-        log.info("poll: {} received | {} new, {} updated, {} stale | store holds {} vehicles on {} routes | {}ms",
-                result.received(), stats.created(), stats.updated(), stats.stale(),
+        log.info("poll: {} received | {} new, {} updated, {} stale, {} rejected"
+                        + " | store holds {} vehicles on {} routes | {}ms",
+                result.received(), stats.created(), stats.updated(), stats.stale(), stats.rejected(),
                 store.size(), store.routeCount(), millis);
 
         return result;

@@ -46,7 +46,8 @@ public final class IngestService implements AutoCloseable {
     public IngestService(VehicleFeed feed, Config config,
                          Consumer<List<VehiclePosition>> downstream) {
         this.config = config;
-        this.store = new VehicleStore();
+        // evictAfter is handed to the store once, and governs both admission and eviction there.
+        this.store = new VehicleStore(config.evictAfter());
         this.poller = new FeedPoller(feed, store, config.maxRequestsPerSecond(), downstream);
 
         // Two threads: one polls, one evicts. Keeping eviction off the polling thread means a slow
@@ -97,7 +98,7 @@ public final class IngestService implements AutoCloseable {
 
     private void sweep() {
         try {
-            int removed = store.evictStale(config.evictAfter());
+            int removed = store.evictStale();
             if (removed > 0) {
                 log.info("Evicted {} stale vehicles; {} remain", removed, store.size());
             }

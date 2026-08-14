@@ -6,6 +6,7 @@ import dev.headway.common.VehiclePosition;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -21,12 +22,48 @@ import org.junit.jupiter.api.Test;
 class VehicleStoreTest {
 
     private static final Instant T0 = Instant.parse("2026-08-14T21:00:00Z");
+    private static final Duration MAX_AGE = Duration.ofMinutes(10);
 
     private VehicleStore store;
 
+    /**
+     * A clock the test drives by hand.
+     *
+     * <p>Two reasons this beats {@code Instant.now()}. The store now rejects readings older than
+     * {@code maxAge}, so a test using a hard-coded date would start failing ten minutes after it
+     * was written and never pass again. And testing eviction needs time to <em>pass</em>, which
+     * otherwise means {@code Thread.sleep} — slow, and flaky on a loaded CI box.
+     */
+    private static final class TestClock extends Clock {
+        private Instant now;
+
+        TestClock(Instant now) {
+            this.now = now;
+        }
+
+        void advance(Duration by) {
+            now = now.plus(by);
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+    }
+
     @BeforeEach
     void setUp() {
-        store = new VehicleStore();
+        store = new VehicleStore(Clock.fixed(T0, ZoneOffset.UTC), MAX_AGE);
     }
 
     private static VehiclePosition ping(String vehicleId, String routeId, Instant at) {
@@ -79,19 +116,6 @@ class VehicleStoreTest {
     }
 
     @Test
-    @DisplayName("vehicles that stopped reporting are evicted")
-    void evictsSilentVehicles() {
-        Clock fixed = Clock.fixed(T0.plus(Duration.ofMinutes(30)), ZoneOffset.UTC);
-        VehicleStore withClock = new VehicleStore(fixed);
-
-        withClock.apply(ping("old-bus", "15", T0));                          // 30 min ago
-        withClock.apply(ping("live-bus", "15", T0.plus(Duration.ofMinutes(29)))); // 1 min ago
-
-        assertThat(withClock.evictStale(Duration.ofMinutes(10))).isEqualTo(1);
-        assertThat(withClock.snapshot()).containsOnlyKeys("live-bus");
-    }
-
-    @Test
     @DisplayName("onRoute filters to one route")
     void filtersByRoute() {
         store.apply(ping("bus-1", "15", T0));
@@ -101,6 +125,104 @@ class VehicleStoreTest {
         assertThat(store.onRoute("15")).extracting(VehiclePosition::vehicleId)
                 .containsExactly("bus-1", "bus-2");
         assertThat(store.routeCount()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("vehicles that go silent are evicted once they age past maxAge")
+    void evictsSilentVehicles() {
+        TestClock clock = new TestClock(T0);
+        VehicleStore withClock = new VehicleStore(clock, MAX_AGE);
+
+        withClock.apply(ping("goes-quiet", "15", T0));
+        clock.advance(Duration.ofMinutes(20));
+        withClock.apply(ping("still-live", "15", T0.plus(Duration.ofMinutes(20))));
+
+        assertThat(withClock.evictStale()).isEqualTo(1);
+        assertThat(withClock.snapshot()).containsOnlyKeys("still-live");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Admission control. These cover the bug found by running the service against the live feed:
+    // a bus with a frozen GPS stayed in MARTA's feed with an unchanging timestamp, so the sweep
+    // evicted it and the very next poll re-added it as NEW, once a minute, forever.
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("a reading already older than maxAge is refused, not stored")
+    void refusesReadingsOlderThanMaxAge() {
+        // now is T0; this reading is 12 minutes stale, past the 10 minute limit.
+        assertThat(store.apply(ping("frozen-gps", "96", T0.minus(Duration.ofMinutes(12)))))
+                .isEqualTo(VehicleStore.Outcome.REJECTED);
+
+        assertThat(store.size()).isZero();
+        assertThat(store.rejectedTotal()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("a future-dated reading is refused, so it can never become unevictable")
+    void refusesFutureDatedReadings() {
+        // A transponder with a clock an hour fast. If admitted, no real reading would ever look
+        // newer, and it would never fall past the eviction cutoff either.
+        assertThat(store.apply(ping("bad-clock", "15", T0.plus(Duration.ofHours(1)))))
+                .isEqualTo(VehicleStore.Outcome.REJECTED);
+
+        assertThat(store.size()).isZero();
+    }
+
+    @Test
+    @DisplayName("small clock skew is tolerated rather than treated as an error")
+    void toleratesSmallClockSkew() {
+        assertThat(store.apply(ping("slightly-fast", "15", T0.plusSeconds(30))))
+                .isEqualTo(VehicleStore.Outcome.NEW);
+    }
+
+    /**
+     * The invariant the fix establishes, stated directly.
+     *
+     * <p>Admission and eviction read the same {@code maxAge} off the same object, so a reading the
+     * store accepts can never be one the very next sweep throws away. Before the fix this test
+     * failed: the frozen-GPS ping was admitted as {@code NEW} and then immediately evicted.
+     */
+    @Test
+    @DisplayName("anything admitted survives an immediate sweep")
+    void admittedReadingsSurviveTheNextSweep() {
+        TestClock clock = new TestClock(T0.plus(Duration.ofMinutes(12)));
+        VehicleStore s = new VehicleStore(clock, MAX_AGE);
+
+        List<VehiclePosition> feed = List.of(
+                ping("frozen-gps", "96", T0),                              // 12 min stale
+                ping("healthy", "15", T0.plus(Duration.ofMinutes(12))),    // current
+                ping("bad-clock", "3", T0.plus(Duration.ofHours(2))));     // future-dated
+
+        VehicleStore.Stats stats = s.applyAll(feed);
+
+        assertThat(stats.created()).isEqualTo(1);
+        assertThat(stats.rejected()).isEqualTo(2);
+        assertThat(stats.total()).isEqualTo(3);
+
+        int sizeBefore = s.size();
+        assertThat(s.evictStale()).as("nothing admitted should be immediately evictable").isZero();
+        assertThat(s.size()).isEqualTo(sizeBefore);
+        assertThat(s.snapshot()).containsOnlyKeys("healthy");
+    }
+
+    @Test
+    @DisplayName("a frozen-GPS vehicle does not oscillate between evicted and re-added")
+    void frozenVehicleDoesNotChurn() {
+        TestClock clock = new TestClock(T0.plus(Duration.ofMinutes(12)));
+        VehicleStore s = new VehicleStore(clock, MAX_AGE);
+        VehiclePosition frozen = ping("frozen-gps", "96", T0);
+
+        // Simulate several poll/sweep cycles against a feed that keeps re-sending the same ping.
+        for (int cycle = 0; cycle < 5; cycle++) {
+            s.apply(frozen);
+            s.evictStale();
+            clock.advance(Duration.ofMinutes(1));
+        }
+
+        assertThat(s.size()).isZero();
+        assertThat(s.evictedTotal()).as("never admitted, so never evicted").isZero();
+        assertThat(s.rejectedTotal()).isEqualTo(5);
     }
 
     /**
@@ -113,9 +235,6 @@ class VehicleStoreTest {
      * {@code get()}-then-{@code put()} implementation left a stale position in the map on
      * <b>5 of 40 runs</b> on this machine. That ~12% hit rate is exactly what makes the bug
      * dangerous: it passes on your laptop, passes in CI, and corrupts data in production.
-     *
-     * <p>The {@link CountDownLatch} makes all threads start at the same instant. Without it they
-     * begin staggered and rarely collide, so the test would pass even against broken code.
      */
     @Test
     @DisplayName("concurrent scrambled writes still leave the newest reading in place")
@@ -123,6 +242,11 @@ class VehicleStoreTest {
         int threads = 16;
         int pingsPerThread = 500;
         int totalPings = threads * pingsPerThread;
+
+        // The readings span ~2.2 hours, so the clock sits at the end of that range and maxAge is
+        // wide open. This test is about write ordering, not admission control.
+        VehicleStore raceStore = new VehicleStore(
+                Clock.fixed(T0.plusSeconds(totalPings), ZoneOffset.UTC), Duration.ofDays(1));
 
         // Every possible timestamp, shuffled, so no thread gets a tidy ascending run.
         List<VehiclePosition> work = new ArrayList<>(totalPings);
@@ -141,7 +265,7 @@ class VehicleStoreTest {
                     try {
                         startGun.await();
                         for (int i = 0; i < pingsPerThread; i++) {
-                            store.apply(work.get(slice * pingsPerThread + i));
+                            raceStore.apply(work.get(slice * pingsPerThread + i));
                         }
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
@@ -155,10 +279,11 @@ class VehicleStoreTest {
             assertThat(finished.await(30, TimeUnit.SECONDS)).as("all threads finished").isTrue();
         }
 
-        assertThat(store.size()).as("one vehicle, no duplicates").isEqualTo(1);
-        assertThat(store.snapshot().get("bus-1").timestamp())
+        assertThat(raceStore.size()).as("one vehicle, no duplicates").isEqualTo(1);
+        assertThat(raceStore.snapshot().get("bus-1").timestamp())
                 .as("the newest reading must survive every interleaving")
                 .isEqualTo(T0.plusSeconds(totalPings - 1));
-        assertThat(store.appliedTotal() + store.staleTotal()).isEqualTo(totalPings);
+        assertThat(raceStore.rejectedTotal()).as("nothing should be refused here").isZero();
+        assertThat(raceStore.appliedTotal() + raceStore.staleTotal()).isEqualTo(totalPings);
     }
 }

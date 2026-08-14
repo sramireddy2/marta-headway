@@ -96,17 +96,24 @@ Expected output (numbers vary — this is a live feed):
 
 ```
 Starting ingest: poll every 15s, ceiling 0.0667 req/s, evict after 10min
-poll: 193 received | 193 new,   0 updated,   0 stale | 193 vehicles on 66 routes | 718ms
-poll: 193 received |   0 new,   0 updated, 193 stale | 193 vehicles on 66 routes |  33ms
-poll: 192 received |   0 new, 186 updated,   6 stale | 193 vehicles on 66 routes |  27ms
-poll: 192 received |   0 new,   0 updated, 192 stale | 193 vehicles on 66 routes |  28ms
-Evicted 5 stale vehicles; 188 remain
-poll: 191 received |   4 new, 184 updated,   3 stale | 192 vehicles on 66 routes |  37ms
+poll: 186 received | 186 new,   0 updated,   0 stale, 0 rejected | 186 vehicles on 65 routes | 1122ms
+poll: 186 received |   0 new, 180 updated,   6 stale, 0 rejected | 186 vehicles on 65 routes |   47ms
+poll: 186 received |   0 new,   0 updated, 186 stale, 0 rejected | 186 vehicles on 65 routes |   22ms
+poll: 186 received |   0 new, 181 updated,   5 stale, 0 rejected | 186 vehicles on 65 routes |   20ms
+poll: 186 received |   0 new,   0 updated, 186 stale, 0 rejected | 186 vehicles on 65 routes |   23ms
 ```
 
-Reading that: the first poll is all new. Then **every other poll is 100% stale** — MARTA
-republishes roughly every 30 seconds, so a 15-second poll fetches the byte-identical file half the
-time. The idempotency check absorbs the whole duplicate batch and the store does not move.
+| Column | Meaning |
+|--------|---------|
+| `received` | Vehicles in the file MARTA just served |
+| `new` | A vehicle id not currently in the store |
+| `updated` | A strictly newer reading replaced the stored one |
+| `stale` | Duplicate or out-of-order — dropped, and entirely normal |
+| `rejected` | Refused at the door: already older than the freshness window, or future-dated |
+
+**Every other poll is 100% stale.** MARTA republishes roughly every 30 seconds, so a 15-second poll
+fetches the byte-identical file half the time. The idempotency check absorbs the whole duplicate
+batch and the store does not move.
 
 That is not a bug to tune away. Polling faster than the publish rate is deliberate: you do not know
 the publisher's phase, so the only way to see a new file promptly is to ask more often than it
@@ -114,7 +121,17 @@ changes. The correctness property that makes it safe — a re-delivered message 
 same one that will let you replay a Kafka topic from the beginning in step 3 without corrupting
 anything.
 
-The `Evicted 5` line is a separate thread sweeping out buses that finished their shift.
+### Freshness: one threshold, both directions
+
+A vehicle whose GPS transponder freezes stays listed in the feed forever with an unchanging
+timestamp. An earlier version admitted such a vehicle (its id was not in the store, so it looked
+"new"), and the eviction sweep then removed it a minute later, and the next poll re-added it —
+once a minute, indefinitely. Admission and eviction disagreed about what "too old" meant.
+
+`VehicleStore` now takes a single `maxAge` and uses it for **both**, so the invariant holds by
+construction: *nothing can be admitted that the next sweep would immediately remove.* Readings
+more than two minutes in the future are refused for a related reason — nothing would ever look
+newer than them, and they would never age past the cutoff, so they would be permanently stuck.
 
 Runs late at night will show far fewer vehicles. Zero vehicles is normal around 2–4 AM.
 
@@ -129,6 +146,7 @@ The interesting parts, and where to read them:
 | Consistent reads | `VehicleStore.snapshot()` | Guava `ImmutableMap` copy, so readers never see a half-applied batch |
 | Contended counters | `VehicleStore` | `LongAdder`, not `AtomicLong` |
 | Unbounded growth | `VehicleStore.evictStale` | Vehicles silent for 10 minutes are swept |
+| Admission / eviction agreement | `VehicleStore.isAdmissible` | One `maxAge` governs both, so a reading can never be accepted and then immediately swept |
 | Politeness to MARTA | [`FeedPoller`](headway-ingest/src/main/java/dev/headway/ingest/FeedPoller.java) | Guava `RateLimiter` as a hard ceiling, independent of the scheduler's cadence |
 | Scheduler survival | `FeedPoller.run()` | Catches `Throwable`; an escaping exception silently cancels a `scheduleWithFixedDelay` task forever |
 | Overload behaviour | [`IngestService`](headway-ingest/src/main/java/dev/headway/ingest/IngestService.java) | `scheduleWithFixedDelay`, not `AtFixedRate`, so slow responses never cause a thundering catch-up |
