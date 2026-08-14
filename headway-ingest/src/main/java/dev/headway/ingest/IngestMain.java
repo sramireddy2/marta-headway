@@ -1,52 +1,58 @@
 package dev.headway.ingest;
 
 import dev.headway.common.VehiclePosition;
-import java.util.List;
+import dev.headway.ingest.kafka.KafkaPositionPublisher;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
-import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Step 2 entry point: poll MARTA continuously and keep a live view of every bus in memory.
+ * Step 3 entry point: poll MARTA continuously and publish every position to Kafka.
  *
- * <p>Run with:
+ * <p>Requires a broker. Start one with {@code docker compose up -d}.
  *
- * <pre>{@code mvnw -q -pl headway-ingest -am package exec:java -DskipTests}</pre>
+ * <pre>{@code .\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests}</pre>
  *
- * <p>Press Ctrl+C to stop; the shutdown hook drains the executor cleanly.
+ * <p>Press Ctrl+C to stop; the shutdown hook drains the executor and flushes Kafka.
  */
 public final class IngestMain {
 
     private static final Logger log = LoggerFactory.getLogger(IngestMain.class);
 
     public static void main(String[] args) throws Exception {
+        Map<String, String> kafka = KafkaPositionPublisher.environmentConfig();
+        String bootstrap = kafka.get("bootstrap");
+        String topic = kafka.get("topic");
+
+        log.info("Kafka at {}, topic '{}'", bootstrap, topic);
+        KafkaPositionPublisher.ensureTopic(bootstrap, topic, KafkaPositionPublisher.DEFAULT_PARTITIONS);
+
         GtfsRealtimeClient client = new GtfsRealtimeClient(GtfsRealtimeClient.MARTA_VEHICLE_POSITIONS);
 
-        // In step 3 this lambda becomes "publish to Kafka". Wiring the seam in now means that
-        // change touches one line instead of restructuring the poller.
-        Consumer<List<VehiclePosition>> downstream =
-                positions -> log.debug("downstream received {} positions", positions.size());
+        // The `downstream` seam from step 2 finally earns its keep: swapping a debug log for a
+        // Kafka producer is this one line.
+        try (KafkaPositionPublisher publisher = KafkaPositionPublisher.create(bootstrap, topic)) {
+            IngestService service =
+                    new IngestService(client, IngestService.Config.defaults(), publisher);
 
-        IngestService service =
-                new IngestService(client, IngestService.Config.defaults(), downstream);
+            // A shutdown hook runs when the JVM is asked to exit: Ctrl+C, `kill`, IDE stop button.
+            // Order matters here — stop polling first, then flush Kafka, so nothing is still being
+            // produced while we are trying to drain.
+            CountDownLatch shutdown = new CountDownLatch(1);
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                log.info("Shutdown signal received.");
+                service.close();
+                publisher.close();
+                printBusiestRoutes(service.store());
+                shutdown.countDown();
+            }, "headway-shutdown"));
 
-        // A shutdown hook runs when the JVM is asked to exit: Ctrl+C, `kill`, IDE stop button.
-        // Without one, Ctrl+C kills the process mid-poll and (later) leaves Kafka messages
-        // unflushed. The latch lets main() park until then instead of spinning.
-        CountDownLatch shutdown = new CountDownLatch(1);
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            log.info("Shutdown signal received.");
-            service.close();
-            printBusiestRoutes(service.store());
-            shutdown.countDown();
-        }, "headway-shutdown"));
-
-        service.start();
-        log.info("Ingest running. Ctrl+C to stop.");
-        shutdown.await();
+            service.start();
+            log.info("Ingest running. Ctrl+C to stop.");
+            shutdown.await();
+        }
     }
 
     /**

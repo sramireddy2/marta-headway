@@ -40,7 +40,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 |------|--------------|:----:|
 | 1 | Repo skeleton, Maven build, GTFS-Realtime protobuf decoding | ✅ |
 | 2 | Scheduled polling, rate limiting, idempotent concurrent store | ✅ |
-| 3 | Kafka in Docker + keyed producer | ☐ |
+| 3 | Kafka in Docker + producer keyed by route | ✅ |
 | 4 | Bounded queue, backpressure, virtual threads, Micrometer metrics | ☐ |
 | 5 | Static GTFS ingest (routes, trips, shapes) + Guava LoadingCache | ☐ |
 | 6 | Project GPS onto route shape → "distance along route" | ☐ |
@@ -55,7 +55,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 ## Requirements
 
 - **JDK 21.** Not 25 — Apache Spark supports 17 and 21 only, and step 7 depends on it.
-- **Docker Desktop** (from step 3 onward, for Kafka).
+- **Docker Desktop**, running. Kafka lives in Compose from step 3 onward.
 - Nothing else. Maven is supplied by the wrapper (`mvnw` / `mvnw.cmd`), which downloads itself.
 
 ### Set JAVA_HOME
@@ -76,6 +76,20 @@ apply to shells started afterwards:
 
 ## Build and run
 
+### Start Kafka
+
+```bash
+docker compose up -d
+```
+
+Wait until it reports healthy (about 20 seconds):
+
+```bash
+docker compose ps
+```
+
+`docker compose down` stops it and keeps the data; `docker compose down -v` wipes the log too.
+
 > **PowerShell users:** PowerShell will not run a script from the current directory without a
 > leading `.\`, and it needs the `.cmd` extension. Use `.\mvnw.cmd`. In Git Bash, macOS, or Linux
 > use `./mvnw` instead.
@@ -86,11 +100,19 @@ Run the tests:
 .\mvnw.cmd -B test
 ```
 
-Poll the live MARTA feed continuously and hold every bus in memory. Ctrl+C to stop:
+Poll the live MARTA feed continuously, hold every bus in memory, and publish each position to
+Kafka. Ctrl+C to stop:
 
 ```bash
 .\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests
 ```
+
+Configuration comes from the environment, with working defaults:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `HEADWAY_KAFKA_BOOTSTRAP` | `localhost:9092` | Broker address |
+| `HEADWAY_KAFKA_TOPIC` | `vehicle-positions` | Destination topic |
 
 Expected output (numbers vary — this is a live feed):
 
@@ -135,6 +157,59 @@ newer than them, and they would never age past the cutoff, so they would be perm
 
 Runs late at night will show far fewer vehicles. Zero vehicles is normal around 2–4 AM.
 
+## Kafka
+
+Topic `vehicle-positions`, 6 partitions, **keyed by `routeId`**, values as JSON.
+
+```
+Partition:0  15  {"vehicleId":"2322","routeId":"15","tripId":"10785433","directionId":5,
+                  "latitude":33.79291915893555,"longitude":-84.3209228515625,
+                  "bearingDegrees":null,"speedMetersPerSecond":null,
+                  "timestamp":"2026-08-14T22:54:08Z"}
+```
+
+### Why the key is the route
+
+Kafka guarantees ordering **within a partition** and promises nothing across partitions. A keyed
+record is hashed to a partition, so every record sharing a key stays in one partition, in order.
+
+Headway compares buses on the same route against each other. Spread route 15 across six partitions
+and a consumer can read 10:00:30 for one bus before 10:00:15 for the bus ahead of it, then compute
+a gap from two readings that never coexisted. Keying by route makes that impossible.
+
+Keying by `vehicleId` is the tempting mistake — it balances load more evenly, and it destroys
+exactly the ordering the calculation needs. **The key follows the query you intend to run, not the
+load distribution.**
+
+Verified against the running broker: 547 records over 65 routes, spread across all 6 partitions,
+with **zero routes split across more than one partition**.
+
+```bash
+docker exec headway-kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic vehicle-positions
+```
+
+### Producer settings that matter
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `acks` | `all` | A leader can acknowledge and die before any follower has the record. With one local replica this is free; it is already correct when it stops being free. |
+| `enable.idempotence` | `true` | A retry after a lost acknowledgement would otherwise duplicate the record. The broker dedupes by sequence number — the same property `VehicleStore` enforces in memory, now enforced on the wire. |
+| `linger.ms` | `20` | ~190 records per poll leave as a few requests instead of 190 round trips. |
+| `max.block.ms` | `10000` | The default 60s means a dead broker looks like a hang rather than an error. |
+
+`send()` is asynchronous — it buffers and returns. Calling `.get()` on the returned future per
+record makes it synchronous and collapses throughput; the publisher uses a callback instead.
+
+## Known data quirks
+
+**MARTA's `direction_id` is not the GTFS direction.** The spec says 0 or 1 (outbound/inbound). The
+live feed yields 5, 9, 11, 14, 17 and null — no 0 or 1 at all.
+
+This is not cosmetic. Headway only means something between buses travelling the *same way*; a
+northbound and a southbound bus passing each other are not consecutive, and treating them as such
+invents bunching that is not happening. Real direction has to come from joining `tripId` to the
+static GTFS `trips.txt`, which step 5 loads. Until then, nothing branches on this field.
+
 ## Concurrency notes
 
 The interesting parts, and where to read them:
@@ -159,9 +234,14 @@ naive `get()`-then-`put()` implementation served a stale position on 5 of 40 run
 
 ```
 headway-parent          the root pom: dependency versions, Java level, module list
-├── headway-common      domain model shared by everything (VehiclePosition)
-└── headway-ingest      polls GTFS-Realtime, decodes protobuf, emits domain objects
+├── headway-common      domain model + the JSON contract (VehiclePosition, Json)
+└── headway-ingest      polls GTFS-Realtime, decodes protobuf, publishes to Kafka
 ```
+
+`headway-common` deliberately has **no** Kafka dependency. The domain model defines what a vehicle
+position *is* and how it is written as JSON; how those bytes get transported is the ingest module's
+concern, and Spark in step 7 will read the same JSON without going through Kafka's serializer API
+at all.
 
 More modules arrive with later steps (`headway-stream` for Spark, `headway-api` for Spring Boot).
 They are kept separate on purpose: Spark and Spring Boot both drag in large, opinionated,

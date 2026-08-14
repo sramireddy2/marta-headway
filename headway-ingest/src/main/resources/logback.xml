@@ -15,4 +15,14 @@
   </root>
 
   <logger name="dev.headway" level="DEBUG"/>
+
+  <!--
+    Kafka's AbstractConfig logs every single resolved config value at INFO on each client
+    creation - roughly 90 lines per producer, consumer and admin client. Useful once when
+    debugging a connection problem, pure noise otherwise. WARN keeps genuine problems
+    (disconnections, retries, coordinator changes) visible while hiding the dump.
+  -->
+  <logger name="org.apache.kafka" level="WARN"/>
+  <logger name="org.apache.kafka.clients.producer.ProducerConfig" level="WARN"/>
+  <logger name="org.apache.kafka.common.metrics" level="WARN"/>
 </configuration>

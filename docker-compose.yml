@@ -1,0 +1,70 @@
+# Local Kafka for development.
+#
+# Kafka 4.x runs in KRaft mode: the cluster manages its own metadata and there is no ZooKeeper
+# container any more. Older tutorials all show a second `zookeeper:` service — you do not need it.
+#
+#   docker compose up -d      start
+#   docker compose ps         check health
+#   docker compose down       stop (keeps data)
+#   docker compose down -v    stop and wipe the log
+
+services:
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: headway-kafka
+    ports:
+      # Only the host listener is published. 9093 (controller) and 29092 (in-network) stay internal.
+      - "9092:9092"
+    environment:
+      # --- KRaft: this single node is both the broker and the controller quorum ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+
+      # --- Listeners: the single most common thing people get wrong ---
+      #
+      # A Kafka client's first request returns *metadata* telling it which host:port to use for
+      # subsequent requests. So the address the broker ADVERTISES has to be reachable from wherever
+      # the client is running. One address cannot satisfy both audiences:
+      #
+      #   - your Java app on Windows reaches the broker at  localhost:9092
+      #   - a container on this compose network reaches it at  kafka:29092
+      #
+      # Advertise only "localhost" and containerised clients break; advertise only "kafka" and your
+      # IDE breaks — with a confusing error, because the initial connection succeeds and only the
+      # follow-up fails. Two listeners, two advertised addresses, no ambiguity.
+      KAFKA_LISTENERS: HOST://0.0.0.0:9092,DOCKER://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:9092,DOCKER://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,HOST:PLAINTEXT,DOCKER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+
+      # --- Single-node settings ---
+      # These internal topics default to 3 replicas. With one broker that is impossible, and the
+      # broker refuses to create them, so every consumer group hangs. Always set these to 1 locally.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+      # Fixed so the on-disk log stays valid when the container is recreated. A random id each
+      # start would make Kafka refuse to mount the existing volume.
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+    healthcheck:
+      # Compose reports "healthy" only once the broker actually answers an API call. Waiting for
+      # the port to open is not enough; Kafka accepts TCP well before it can serve metadata.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  kafka-data:

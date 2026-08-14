@@ -7,6 +7,18 @@ import java.util.OptionalDouble;
 /**
  * One GPS ping from one bus, at one moment in time.
  *
+ * <p><b>Warning about {@code directionId}.</b> The GTFS spec says {@code direction_id} is 0 or 1 —
+ * outbound or inbound. MARTA does not follow that. A sample of the live feed produced the values
+ * 5, 9, 11, 14, 17 and null, with no 0 or 1 anywhere. Whatever they mean, they are not the GTFS
+ * direction flag.
+ *
+ * <p>This matters more than it looks. Headway only makes sense between buses travelling the
+ * <em>same way</em> along a route; a northbound and a southbound bus that pass each other are not
+ * "consecutive" in any useful sense, and treating them as such would report bunching that is not
+ * there. So do not branch on this field. The real direction comes from joining {@link #tripId} to
+ * the static GTFS {@code trips.txt}, which step 5 loads. The field is kept because it is what the
+ * feed sends and discarding source data is worse than labelling it.
+ *
  * <p>This is a Java {@code record}: an immutable data carrier. The compiler generates the
  * constructor, the getters ({@code vehicleId()}, not {@code getVehicleId()}),
  * {@code equals}/{@code hashCode}, and {@code toString} for us.

@@ -15,6 +15,21 @@
   <description>Shared domain model used by every other module.</description>
 
   <dependencies>
+    <!--
+      Jackson lives here rather than in each module because the JSON shape of a VehiclePosition is
+      a contract between the producer (ingest) and every consumer (Spark, the API). One definition,
+      one place. Note there is deliberately no Kafka dependency in this module: how the bytes are
+      transported is not the domain model's business.
+    -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
+    </dependency>
+
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
