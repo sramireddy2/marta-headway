@@ -2,6 +2,7 @@ package dev.headway.ingest;
 
 import dev.headway.common.VehiclePosition;
 import dev.headway.ingest.kafka.KafkaPositionPublisher;
+import dev.headway.ingest.pipeline.IngestMetrics;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.stream.Collectors;
@@ -31,11 +32,14 @@ public final class IngestMain {
 
         GtfsRealtimeClient client = new GtfsRealtimeClient(GtfsRealtimeClient.MARTA_VEHICLE_POSITIONS);
 
+        IngestMetrics metrics = new IngestMetrics();
+
         // The `downstream` seam from step 2 finally earns its keep: swapping a debug log for a
         // Kafka producer is this one line.
-        try (KafkaPositionPublisher publisher = KafkaPositionPublisher.create(bootstrap, topic)) {
-            IngestService service =
-                    new IngestService(client, IngestService.Config.defaults(), publisher);
+        try (KafkaPositionPublisher publisher = KafkaPositionPublisher.create(bootstrap, topic)
+                .withMetrics(metrics::recordKafkaSent, metrics::recordKafkaFailed)) {
+            IngestService service = new IngestService(
+                    client, IngestService.Config.fromEnvironment(), publisher, metrics);
 
             // A shutdown hook runs when the JVM is asked to exit: Ctrl+C, `kill`, IDE stop button.
             // Order matters here — stop polling first, then flush Kafka, so nothing is still being

@@ -2,20 +2,23 @@ package dev.headway.ingest;
 
 import com.google.common.util.concurrent.RateLimiter;
 import dev.headway.common.VehiclePosition;
+import dev.headway.ingest.pipeline.IngestMetrics;
+import dev.headway.ingest.pipeline.ShardedPositionQueue;
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * One poll of one feed: rate-limit, fetch, decode, apply to the store, hand off downstream.
+ * One poll of one feed: rate-limit, fetch, decode, hand every position to the queue.
  *
- * <p>This class is a {@link Runnable} so a scheduler can drive it, but the real work lives in
- * {@link #pollOnce()}, which returns a result and is allowed to throw. Tests call {@code pollOnce},
- * the scheduler calls {@code run}.
+ * <p>Since step 4 the poller does <em>not</em> touch the store or Kafka. Its only job is to get
+ * data out of the network and into the queue; workers do everything after that. That split is what
+ * makes backpressure possible — there is now a boundary where "producers are outrunning consumers"
+ * is a thing that can be observed and acted on, rather than one long call stack.
  *
  * <h2>The footgun this class exists to avoid</h2>
  *
@@ -31,10 +34,11 @@ public final class FeedPoller implements Runnable {
 
     private static final Logger log = LoggerFactory.getLogger(FeedPoller.class);
 
+    private final String name;
     private final VehicleFeed feed;
-    private final VehicleStore store;
+    private final ShardedPositionQueue queue;
     private final RateLimiter rateLimiter;
-    private final Consumer<List<VehiclePosition>> downstream;
+    private final IngestMetrics metrics;
 
     private final LongAdder pollsAttempted = new LongAdder();
     private final LongAdder pollsFailed = new LongAdder();
@@ -43,16 +47,13 @@ public final class FeedPoller implements Runnable {
     /**
      * @param maxRequestsPerSecond politeness ceiling for this feed. MARTA publishes every ~15s, so
      *     anything above {@code 1/15} is wasted bandwidth for them and for you.
-     * @param downstream where decoded positions go next. Today: a logger. In step 3: Kafka.
      */
-    public FeedPoller(
-            VehicleFeed feed,
-            VehicleStore store,
-            double maxRequestsPerSecond,
-            Consumer<List<VehiclePosition>> downstream) {
+    public FeedPoller(String name, VehicleFeed feed, ShardedPositionQueue queue,
+                      double maxRequestsPerSecond, IngestMetrics metrics) {
+        this.name = name;
         this.feed = feed;
-        this.store = store;
-        this.downstream = downstream;
+        this.queue = queue;
+        this.metrics = metrics;
 
         // A token bucket. Permits accrue at maxRequestsPerSecond; acquire() takes one, blocking
         // the calling thread if none is available yet.
@@ -74,21 +75,21 @@ public final class FeedPoller implements Runnable {
             // Someone asked this thread to stop. Restore the flag we just cleared by catching, so
             // code further up the stack can still see the interrupt. Never swallow it outright.
             Thread.currentThread().interrupt();
-            log.info("Poller interrupted; stopping.");
+            log.info("Poller {} interrupted; stopping.", name);
         } catch (Throwable t) {
             // Deliberately Throwable, not Exception. An OutOfMemoryError or a NoClassDefFoundError
             // would otherwise silently kill the schedule too.
-            log.error("Poll failed ({} in a row). Continuing.", consecutiveFailures.get(), t);
+            log.error("Poll {} failed ({} in a row). Continuing.", name, consecutiveFailures.get(), t);
         }
     }
 
-    /** Does the actual work. Returns what changed. */
+    /** Does the actual work. Returns what happened. */
     public Result pollOnce() throws IOException, InterruptedException {
         pollsAttempted.increment();
 
         double waitedSeconds = rateLimiter.acquire(); // blocks until a permit is free
         if (waitedSeconds > 0.01) {
-            log.debug("Rate limiter held the poll for {}s", "%.2f".formatted(waitedSeconds));
+            log.debug("Rate limiter held {} for {}s", name, "%.2f".formatted(waitedSeconds));
         }
 
         long startNanos = System.nanoTime();
@@ -98,26 +99,42 @@ public final class FeedPoller implements Runnable {
         } catch (IOException | InterruptedException e) {
             pollsFailed.increment();
             consecutiveFailures.incrementAndGet();
+            metrics.recordPollFailure();
             throw e;
         }
         consecutiveFailures.set(0);
+        metrics.recordFetched(positions.size());
 
-        VehicleStore.Stats stats = store.applyAll(positions);
-        downstream.accept(positions);
+        // Hand off to the queue. Any of these puts can block if a shard is full; that is the
+        // pipeline telling us to slow down, and blocking here is the correct response.
+        long blockedNanos = 0;
+        for (VehiclePosition position : positions) {
+            blockedNanos += queue.put(position);
+        }
 
-        long millis = (System.nanoTime() - startNanos) / 1_000_000;
-        Result result = new Result(positions.size(), stats, millis);
+        long totalNanos = System.nanoTime() - startNanos;
+        metrics.pollDuration().record(totalNanos, TimeUnit.NANOSECONDS);
 
-        log.info("poll: {} received | {} new, {} updated, {} stale, {} rejected"
-                        + " | store holds {} vehicles on {} routes | {}ms",
-                result.received(), stats.created(), stats.updated(), stats.stale(), stats.rejected(),
-                store.size(), store.routeCount(), millis);
+        Result result = new Result(positions.size(), totalNanos / 1_000_000, blockedNanos / 1_000_000);
 
+        if (result.blockedMillis() > 0) {
+            log.info("poll {}: {} positions enqueued in {}ms ({}ms BLOCKED on a full queue) | queue {}/{}",
+                    name, result.received(), result.durationMillis(), result.blockedMillis(),
+                    queue.depth(), queue.totalCapacity());
+        } else {
+            log.debug("poll {}: {} positions enqueued in {}ms | queue {}/{}",
+                    name, result.received(), result.durationMillis(),
+                    queue.depth(), queue.totalCapacity());
+        }
         return result;
     }
 
     /** Outcome of one poll. */
-    public record Result(int received, VehicleStore.Stats stats, long durationMillis) {}
+    public record Result(int received, long durationMillis, long blockedMillis) {}
+
+    public String name() {
+        return name;
+    }
 
     public long pollsAttemptedTotal() {
         return pollsAttempted.sum();

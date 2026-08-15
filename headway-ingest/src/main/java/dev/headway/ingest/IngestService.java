@@ -1,8 +1,13 @@
 package dev.headway.ingest;
 
 import dev.headway.common.VehiclePosition;
+import dev.headway.ingest.pipeline.IngestMetrics;
+import dev.headway.ingest.pipeline.PositionWorker;
+import dev.headway.ingest.pipeline.ShardedPositionQueue;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
@@ -13,10 +18,36 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Owns the background threads: polls the feed on a timer and sweeps out dead vehicles.
+ * Owns every thread in the ingest pipeline and the order in which they shut down.
  *
- * <p>Implements {@link AutoCloseable} so it can be used in try-with-resources and so shutdown is
- * impossible to forget.
+ * <pre>
+ *   scheduler          fetch pool            queue (bounded, sharded)      workers
+ *   1 platform thread  virtual threads       4 shards x 256                4 platform threads
+ *        |                   |                        |                         |
+ *   every 15s ------&gt; submit fetch -----&gt; put() (blocks when full) -----&gt; store + Kafka
+ * </pre>
+ *
+ * <h2>Three different thread choices, on purpose</h2>
+ *
+ * <b>Scheduler — one platform thread.</b> Java 21 has no virtual-thread scheduled executor, and it
+ * does not need one: this thread does nothing but wake up and submit. Keeping the timer off the
+ * work pool is also what stops a slow fetch from delaying the next tick.
+ *
+ * <p><b>Fetches — virtual threads.</b> A fetch is almost entirely waiting on a socket. A platform
+ * thread parked on I/O still costs a megabyte of stack and an OS scheduler slot; a virtual thread
+ * parked on I/O costs a few hundred bytes of heap, because the JVM unmounts it from its carrier
+ * thread while it waits. With one feed today the difference is academic and it would be dishonest
+ * to claim otherwise — the point is that adding the trip-updates feed in step 5, and other
+ * agencies after that, costs nothing.
+ *
+ * <p><b>Workers — a small fixed pool of platform threads.</b> This is the part people get wrong
+ * after discovering virtual threads. Workers do CPU work (hashing, JSON encoding) on data already
+ * in memory. Virtual threads make blocking cheap; they do not make computation faster, and a
+ * virtual thread per task would just create unbounded concurrency over a bounded CPU. A fixed pool
+ * sized to the shard count is right here, and the count is fixed by ordering anyway: exactly one
+ * worker per shard.
+ *
+ * <p>The rule worth remembering: <b>virtual threads for waiting, platform threads for working.</b>
  */
 public final class IngestService implements AutoCloseable {
 
@@ -27,36 +58,100 @@ public final class IngestService implements AutoCloseable {
             Duration pollInterval,
             double maxRequestsPerSecond,
             Duration evictAfter,
-            Duration evictionSweepInterval) {
+            Duration evictionSweepInterval,
+            int shardCount,
+            int queueCapacityPerShard,
+            Duration metricsInterval) {
 
         public static Config defaults() {
             return new Config(
                     Duration.ofSeconds(15),   // MARTA republishes roughly this often
                     1.0 / 15.0,               // ceiling: one request per 15 seconds
                     Duration.ofMinutes(10),   // a bus silent for 10 min has finished its run
-                    Duration.ofMinutes(1));
+                    Duration.ofMinutes(1),
+                    4,                        // shards, and therefore workers
+                    256,                      // per shard: ~1024 total, vs ~190 per poll
+                    Duration.ofSeconds(30));
+        }
+
+        /**
+         * Defaults, with the queue geometry overridable from the environment.
+         *
+         * <p>Exposed mainly so backpressure can be demonstrated on demand. At the default 1024
+         * slots against ~190 positions per poll the queue never fills, which is correct but means
+         * you never see the mechanism work. Shrink it and the producer starts blocking:
+         *
+         * <pre>{@code $env:HEADWAY_QUEUE_CAPACITY = "4"}</pre>
+         */
+        public static Config fromEnvironment() {
+            Config base = defaults();
+            return new Config(
+                    base.pollInterval(),
+                    base.maxRequestsPerSecond(),
+                    base.evictAfter(),
+                    base.evictionSweepInterval(),
+                    intEnv("HEADWAY_QUEUE_SHARDS", base.shardCount()),
+                    intEnv("HEADWAY_QUEUE_CAPACITY", base.queueCapacityPerShard()),
+                    base.metricsInterval());
+        }
+
+        private static int intEnv(String name, int fallback) {
+            String raw = System.getenv(name);
+            if (raw == null || raw.isBlank()) {
+                return fallback;
+            }
+            try {
+                return Integer.parseInt(raw.trim());
+            } catch (NumberFormatException e) {
+                log.warn("{}='{}' is not a number; using {}", name, raw, fallback);
+                return fallback;
+            }
         }
     }
 
-    private final VehicleStore store;
-    private final FeedPoller poller;
     private final Config config;
+    private final IngestMetrics metrics;
+    private final VehicleStore store;
+    private final ShardedPositionQueue queue;
+    private final FeedPoller poller;
+    private final List<PositionWorker> workers = new ArrayList<>();
+
     private final ScheduledExecutorService scheduler;
+    private final ExecutorService fetchExecutor;
+    private final ExecutorService workerExecutor;
 
-    public IngestService(VehicleFeed feed, Config config,
-                         Consumer<List<VehiclePosition>> downstream) {
+    public IngestService(VehicleFeed feed, Config config, Consumer<VehiclePosition> publisher) {
+        this(feed, config, publisher, new IngestMetrics());
+    }
+
+    public IngestService(VehicleFeed feed, Config config, Consumer<VehiclePosition> publisher,
+                         IngestMetrics metrics) {
         this.config = config;
-        // evictAfter is handed to the store once, and governs both admission and eviction there.
+        this.metrics = metrics;
         this.store = new VehicleStore(config.evictAfter());
-        this.poller = new FeedPoller(feed, store, config.maxRequestsPerSecond(), downstream);
+        this.queue = new ShardedPositionQueue(config.shardCount(), config.queueCapacityPerShard(), metrics);
+        this.poller = new FeedPoller("vehicle-positions", feed, queue,
+                config.maxRequestsPerSecond(), metrics);
 
-        // Two threads: one polls, one evicts. Keeping eviction off the polling thread means a slow
-        // sweep can never delay a poll.
-        //
-        // These are named. Unnamed executor threads show up in stack traces and profilers as
-        // "pool-1-thread-1", which tells you nothing at 2am. Naming threads costs one class and
-        // pays for itself the first time you read a thread dump.
-        this.scheduler = Executors.newScheduledThreadPool(2, namedThreadFactory("headway-ingest"));
+        this.scheduler = Executors.newScheduledThreadPool(2, namedThreadFactory("headway-sched"));
+        this.fetchExecutor = Executors.newThreadPerTaskExecutor(
+                Thread.ofVirtual().name("headway-fetch-", 0).factory());
+        this.workerExecutor = Executors.newFixedThreadPool(
+                config.shardCount(), namedThreadFactory("headway-worker"));
+
+        for (int shard = 0; shard < config.shardCount(); shard++) {
+            workers.add(new PositionWorker(shard, queue, store, publisher, metrics));
+        }
+
+        registerGauges();
+    }
+
+    private void registerGauges() {
+        metrics.gauge("headway.queue.depth", "Positions waiting across all shards", queue::depth);
+        metrics.gauge("headway.queue.utilization", "Queue fullness, 0 to 1", queue::utilization);
+        metrics.gauge("headway.queue.capacity", "Total bounded capacity", queue::totalCapacity);
+        metrics.gauge("headway.store.vehicles", "Vehicles currently tracked", store::size);
+        metrics.gauge("headway.store.routes", "Routes with a live vehicle", store::routeCount);
     }
 
     private static ThreadFactory namedThreadFactory(String prefix) {
@@ -70,30 +165,32 @@ public final class IngestService implements AutoCloseable {
         };
     }
 
-    /** Starts polling. Returns immediately; work happens on the background threads. */
+    /** Starts workers and polling. Returns immediately; work happens on the background threads. */
     public void start() {
-        log.info("Starting ingest: poll every {}s, ceiling {} req/s, evict after {}min",
+        log.info("Starting ingest: poll every {}s, ceiling {} req/s, evict after {}min, "
+                        + "{} shards x {} = {} queue slots",
                 config.pollInterval().toSeconds(),
                 "%.4f".formatted(config.maxRequestsPerSecond()),
-                config.evictAfter().toMinutes());
+                config.evictAfter().toMinutes(),
+                config.shardCount(), config.queueCapacityPerShard(), queue.totalCapacity());
 
-        // scheduleWithFixedDelay, NOT scheduleAtFixedRate.
-        //
-        // atFixedRate starts a new run every N seconds measured from the previous *start*. If the
-        // feed hangs for 40s on a 15s schedule, the missed runs queue up and then fire
-        // back-to-back the instant it recovers — hammering a server that is already struggling.
-        //
-        // withFixedDelay waits N seconds after the previous run *finishes*. Slow responses simply
-        // slow the loop down, which is exactly the behaviour you want when talking to something
-        // you do not control.
-        scheduler.scheduleWithFixedDelay(
-                poller, 0, config.pollInterval().toMillis(), TimeUnit.MILLISECONDS);
+        // Workers first. Starting producers before consumers would fill the queue and report
+        // backpressure that is purely an artefact of startup order.
+        workers.forEach(workerExecutor::submit);
 
+        // The scheduler only *submits*; the fetch itself runs on a virtual thread. That keeps the
+        // timer thread free, so a fetch that overruns cannot delay eviction or the next tick.
         scheduler.scheduleWithFixedDelay(
-                this::sweep,
+                () -> fetchExecutor.submit(poller),
+                0, config.pollInterval().toMillis(), TimeUnit.MILLISECONDS);
+
+        scheduler.scheduleWithFixedDelay(this::sweep,
                 config.evictionSweepInterval().toMillis(),
-                config.evictionSweepInterval().toMillis(),
-                TimeUnit.MILLISECONDS);
+                config.evictionSweepInterval().toMillis(), TimeUnit.MILLISECONDS);
+
+        scheduler.scheduleWithFixedDelay(this::reportMetrics,
+                config.metricsInterval().toMillis(),
+                config.metricsInterval().toMillis(), TimeUnit.MILLISECONDS);
     }
 
     private void sweep() {
@@ -108,31 +205,66 @@ public final class IngestService implements AutoCloseable {
         }
     }
 
+    /** The line that makes the pipeline's health legible at a glance. */
+    private void reportMetrics() {
+        try {
+            log.info("metrics | fetched {} -> enqueued {} -> processed {} ({} stale, {} rejected) "
+                            + "| queue {}/{} {} depths={} | blocked {}ms total "
+                            + "| kafka {} sent / {} failed | store {} vehicles on {} routes",
+                    metrics.fetchedTotal(), metrics.enqueuedTotal(), metrics.processedTotal(),
+                    metrics.staleTotal(), metrics.rejectedTotal(),
+                    queue.depth(), queue.totalCapacity(),
+                    "%.0f%%".formatted(queue.utilization() * 100), queue.depths(),
+                    "%.0f".formatted(metrics.totalEnqueueWaitMillis()),
+                    metrics.kafkaSentTotal(), metrics.kafkaFailedTotal(),
+                    store.size(), store.routeCount());
+        } catch (Throwable t) {
+            log.error("Metrics report failed. Continuing.", t);
+        }
+    }
+
     /**
-     * Stops the background threads, giving in-flight work a chance to finish.
-     *
-     * <p>The two-phase dance below is the standard idiom and worth memorising:
+     * Stops everything in the one order that loses no data.
      *
      * <ol>
-     *   <li>{@code shutdown()} — stop accepting new work, let running tasks finish.
-     *   <li>{@code awaitTermination(...)} — wait, but not forever.
-     *   <li>{@code shutdownNow()} — interrupt whatever is still stuck.
+     *   <li><b>Scheduler</b> — stop starting new polls.
+     *   <li><b>Fetch pool</b> — let any in-flight fetch finish enqueuing.
+     *   <li><b>Workers</b> — tell them to stop, but they drain their shard first.
+     *   <li>Only then does the caller close the Kafka publisher and flush.
      * </ol>
      *
-     * Calling only {@code shutdown()} can hang forever on a wedged socket. Calling only
-     * {@code shutdownNow()} kills work that was two milliseconds from completing.
+     * Reversing any two of these drops positions: stop workers first and the queue is abandoned;
+     * flush Kafka first and the last batch of records is produced after the flush.
      */
     @Override
     public void close() {
-        log.info("Shutting down ingest. Final state: {}", store);
+        log.info("Shutting down ingest. Queue holds {} items.", queue.depth());
+
         scheduler.shutdown();
+        awaitOrKill(scheduler, "scheduler", 5);
+
+        fetchExecutor.shutdown();
+        awaitOrKill(fetchExecutor, "fetch pool", 10);
+
+        workers.forEach(PositionWorker::stop);
+        workerExecutor.shutdown();
+        awaitOrKill(workerExecutor, "workers", 15);
+
+        if (!queue.isEmpty()) {
+            log.warn("{} positions were still queued at shutdown and have been dropped.", queue.depth());
+        }
+        reportMetrics();
+        log.info("Final state: {}", store);
+    }
+
+    private static void awaitOrKill(ExecutorService executor, String what, int seconds) {
         try {
-            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                log.warn("Tasks did not finish in 5s; interrupting them.");
-                scheduler.shutdownNow();
+            if (!executor.awaitTermination(seconds, TimeUnit.SECONDS)) {
+                log.warn("{} did not finish in {}s; interrupting.", what, seconds);
+                executor.shutdownNow();
             }
         } catch (InterruptedException e) {
-            scheduler.shutdownNow();
+            executor.shutdownNow();
             Thread.currentThread().interrupt();
         }
     }
@@ -143,5 +275,13 @@ public final class IngestService implements AutoCloseable {
 
     public FeedPoller poller() {
         return poller;
+    }
+
+    public ShardedPositionQueue queue() {
+        return queue;
+    }
+
+    public IngestMetrics metrics() {
+        return metrics;
     }
 }

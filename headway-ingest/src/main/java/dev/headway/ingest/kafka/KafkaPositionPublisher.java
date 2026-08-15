@@ -46,7 +46,7 @@ import org.slf4j.LoggerFactory;
  * <p>The cost is a hot partition when one route is much busier than the rest. With ~65 routes over
  * 6 partitions that is a non-issue, and correctness is not negotiable for a few percent of skew.
  */
-public final class KafkaPositionPublisher implements Consumer<List<VehiclePosition>>, AutoCloseable {
+public final class KafkaPositionPublisher implements Consumer<VehiclePosition>, AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(KafkaPositionPublisher.class);
 
@@ -59,6 +59,11 @@ public final class KafkaPositionPublisher implements Consumer<List<VehiclePositi
 
     private final LongAdder sent = new LongAdder();
     private final LongAdder failed = new LongAdder();
+
+    // Set via withMetrics(). Called from the producer's I/O thread, so they must be cheap and
+    // must not throw — a Micrometer counter increment is both.
+    private volatile Runnable onSuccess;
+    private volatile Runnable onFailure;
 
     /** Primary constructor. Takes a {@link Producer} so tests can pass a {@code MockProducer}. */
     public KafkaPositionPublisher(Producer<String, VehiclePosition> producer, String topic) {
@@ -137,30 +142,53 @@ public final class KafkaPositionPublisher implements Consumer<List<VehiclePositi
     }
 
     /**
-     * Publishes a batch.
+     * Publishes one position.
      *
      * <p>{@code send()} is asynchronous: it appends to an in-memory batch and returns immediately,
      * while a background I/O thread does the network work. Calling {@code .get()} on the returned
      * future per record would make it synchronous and collapse throughput by orders of magnitude —
      * a very common mistake. Instead we pass a callback and let the batch fly.
+     *
+     * <p>Called concurrently by one worker per shard. {@link KafkaProducer} is thread-safe and is
+     * designed to be shared; one producer per thread would multiply the buffers and the
+     * connections for no gain. Per-route ordering survives because a route only ever reaches one
+     * worker, so its records are always offered to the producer in sequence.
      */
     @Override
-    public void accept(List<VehiclePosition> positions) {
-        for (VehiclePosition position : positions) {
-            ProducerRecord<String, VehiclePosition> record =
-                    new ProducerRecord<>(topic, position.routeId(), position);
+    public void accept(VehiclePosition position) {
+        ProducerRecord<String, VehiclePosition> record =
+                new ProducerRecord<>(topic, position.routeId(), position);
 
-            producer.send(record, (metadata, exception) -> {
-                if (exception != null) {
-                    failed.increment();
-                    log.error("Failed to publish vehicle {} on route {}",
-                            position.vehicleId(), position.routeId(), exception);
-                } else {
-                    sent.increment();
+        producer.send(record, (metadata, exception) -> {
+            if (exception != null) {
+                failed.increment();
+                if (onFailure != null) {
+                    onFailure.run();
                 }
-            });
-        }
-        log.debug("Queued {} records to '{}'", positions.size(), topic);
+                log.error("Failed to publish vehicle {} on route {}",
+                        position.vehicleId(), position.routeId(), exception);
+            } else {
+                sent.increment();
+                if (onSuccess != null) {
+                    onSuccess.run();
+                }
+            }
+        });
+    }
+
+    /** Convenience for callers that still hold a batch (tests, and the odd bulk path). */
+    public void acceptAll(List<VehiclePosition> positions) {
+        positions.forEach(this::accept);
+    }
+
+    /**
+     * Hooks so Micrometer counters move when the broker acknowledges, rather than when we asked.
+     * A record is only really published once the callback fires.
+     */
+    public KafkaPositionPublisher withMetrics(Runnable onSuccess, Runnable onFailure) {
+        this.onSuccess = onSuccess;
+        this.onFailure = onFailure;
+        return this;
     }
 
     public long sentTotal() {

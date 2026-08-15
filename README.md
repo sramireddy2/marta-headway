@@ -41,7 +41,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 | 1 | Repo skeleton, Maven build, GTFS-Realtime protobuf decoding | ✅ |
 | 2 | Scheduled polling, rate limiting, idempotent concurrent store | ✅ |
 | 3 | Kafka in Docker + producer keyed by route | ✅ |
-| 4 | Bounded queue, backpressure, virtual threads, Micrometer metrics | ☐ |
+| 4 | Bounded sharded queue, backpressure, virtual threads, Micrometer | ✅ |
 | 5 | Static GTFS ingest (routes, trips, shapes) + Guava LoadingCache | ☐ |
 | 6 | Project GPS onto route shape → "distance along route" | ☐ |
 | 7 | Spark Structured Streaming headway computation | ☐ |
@@ -200,6 +200,108 @@ docker exec headway-kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server
 `send()` is asynchronous — it buffers and returns. Calling `.get()` on the returned future per
 record makes it synchronous and collapses throughput; the publisher uses a callback instead.
 
+## The ingest pipeline
+
+```
+ scheduler          fetch pool           bounded sharded queue          workers
+ 1 platform thread  virtual threads      4 shards x 256 slots           4 platform threads
+      |                   |                       |                          |
+  every 15s -------> submit fetch ------> put() blocks when full ----> store + Kafka
+                     (blocking HTTP)      route -> shard by hash       1 worker per shard
+```
+
+### Backpressure: why the queue is bounded
+
+An unbounded queue does not remove a bottleneck, it hides one. If consumers are slower than
+producers it grows until the heap is gone, and the failure mode is the worst available: minutes of
+rising latency and GC thrash, then `OutOfMemoryError`, with the real cause — a slow consumer —
+nowhere in the stack trace.
+
+A bounded queue turns that into something benign. When it fills, `put()` **blocks the producer**.
+Fetching stops. Memory stays flat. The system runs at the speed of its slowest stage, which is the
+fastest it could correctly go anyway.
+
+That is backpressure: slowness propagating upstream as a *signal* instead of accumulating as
+garbage. Note that a bound of one million is an unbounded queue with extra steps — the bound has to
+be small enough that blocking happens before memory gets interesting.
+
+`ShardedPositionQueueTest.backpressureBlocksTheProducer` proves both halves against a deliberately
+slow consumer: the producer records real blocked time, **and** the queue never exceeds its bound.
+The second assertion is the one that matters — without the bound the test would pass faster and the
+queue would have grown to 40 items, which is the start of the curve that ends in an OOM.
+
+#### Seeing it happen live
+
+At the default 1024 slots against ~190 positions per poll the queue never fills, so the mechanism
+never engages. Shrink it to prove it works:
+
+```bash
+$env:HEADWAY_QUEUE_CAPACITY = "4"
+```
+
+16 total slots against 175-position batches. Real output:
+
+```
+Starting ingest: ... 4 shards x 4 = 16 queue slots
+poll: 176 positions enqueued in 914ms (400ms BLOCKED on a full queue) | queue 0/16
+poll: 176 positions enqueued in  32ms ( 12ms BLOCKED on a full queue) | queue 6/16
+metrics | fetched 702 -> enqueued 702 -> processed 702 | queue 0/16 0% | blocked 434ms total
+        | kafka 702 sent / 0 failed
+```
+
+**fetched 702 → enqueued 702 → processed 702 → 702 published, with a queue eleven times too small
+to hold one batch.** Nothing was dropped and memory never moved; the producer simply waited. Unset
+the variable to go back to the normal configuration.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HEADWAY_QUEUE_SHARDS` | `4` | Shards, and therefore workers |
+| `HEADWAY_QUEUE_CAPACITY` | `256` | Slots per shard |
+
+### Why sharded, and not one queue
+
+One queue with four workers would give parallelism and quietly break step 3. Two workers pulling
+consecutive route-15 readings can call `producer.send()` in either order, so records reach the
+partition out of sequence — destroying the ordering that keying by route exists to provide.
+
+So the queue is split into shards, a route is assigned to one by hashing its id, and **each shard is
+drained by exactly one worker**. Route 15 is always shard 3, always worker 3, always published in
+arrival order. Parallel across routes, strictly ordered within one — the same idea as the Kafka
+partitioning it protects, and the same idea as Guava's `Striped` locks in step 11.
+
+The trade-off is real: an unusually busy route makes its shard the slow one and no other worker can
+help. With ~65 routes over 4 shards that is a rounding error, and correctness is not worth trading
+for it.
+
+### Three thread types, chosen separately
+
+| Stage | Threads | Why |
+|-------|---------|-----|
+| Scheduler | 1 platform | Java 21 has no virtual-thread scheduled executor and this thread only submits. Keeping the timer off the work pool stops a slow fetch delaying the next tick. |
+| Fetches | Virtual | A fetch is almost all socket wait. A platform thread parked on I/O costs ~1 MB of stack and an OS scheduler slot; a virtual thread costs a few hundred bytes because the JVM unmounts it while it waits. |
+| Workers | 4 platform, fixed | Workers do CPU work on in-memory data. Virtual threads make *blocking* cheap, not computation faster, and one per task would create unbounded concurrency over bounded CPU. The count is fixed by ordering anyway — one per shard. |
+
+**Virtual threads for waiting, platform threads for working.** With a single feed today the virtual
+thread benefit is latent, not measured; the point is that adding the trip-updates feed in step 5 and
+other agencies later costs nothing.
+
+### Shutdown order
+
+Scheduler → fetch pool → workers (which drain their shard first) → then the caller flushes Kafka.
+Reversing any two loses data: stop workers first and the queue is abandoned; flush Kafka first and
+the last records are produced after the flush.
+
+## Metrics
+
+Micrometer, currently against an in-memory `SimpleMeterRegistry` logged every 30 seconds. Step 9
+swaps in Spring Boot's Prometheus registry and the same meters appear over HTTP with no call-site
+changes.
+
+The two that matter are `headway.queue.utilization` and `headway.enqueue.wait`. A pipeline that is
+coping and one that is a single slow consumer away from stalling look identical from outside —
+same log lines, same throughput — right up until they are not. The difference lives entirely in how
+full the queue is and how long producers spend blocked.
+
 ## Known data quirks
 
 **MARTA's `direction_id` is not the GTFS direction.** The spec says 0 or 1 (outbound/inbound). The
@@ -225,7 +327,12 @@ The interesting parts, and where to read them:
 | Politeness to MARTA | [`FeedPoller`](headway-ingest/src/main/java/dev/headway/ingest/FeedPoller.java) | Guava `RateLimiter` as a hard ceiling, independent of the scheduler's cadence |
 | Scheduler survival | `FeedPoller.run()` | Catches `Throwable`; an escaping exception silently cancels a `scheduleWithFixedDelay` task forever |
 | Overload behaviour | [`IngestService`](headway-ingest/src/main/java/dev/headway/ingest/IngestService.java) | `scheduleWithFixedDelay`, not `AtFixedRate`, so slow responses never cause a thundering catch-up |
-| Clean shutdown | `IngestService.close()` | `shutdown` → `awaitTermination` → `shutdownNow` |
+| Clean shutdown | `IngestService.close()` | Ordered: scheduler → fetches → workers (draining) → Kafka flush |
+| Memory safety under load | [`ShardedPositionQueue`](headway-ingest/src/main/java/dev/headway/ingest/pipeline/ShardedPositionQueue.java) | Bounded `ArrayBlockingQueue`; `put()` blocks instead of growing |
+| Ordering vs. parallelism | `ShardedPositionQueue.shardFor` | Route hashed to a shard, one worker per shard — parallel across routes, ordered within one |
+| Negative hash indexes | `ShardedPositionQueue.shardFor` | `Math.floorMod`, not `%` or `Math.abs` — `abs(Integer.MIN_VALUE)` is still negative |
+| Cheap blocking I/O | [`IngestService`](headway-ingest/src/main/java/dev/headway/ingest/IngestService.java) | Virtual threads for fetches, platform threads for CPU-bound workers |
+| Observability | [`IngestMetrics`](headway-ingest/src/main/java/dev/headway/ingest/pipeline/IngestMetrics.java) | Micrometer; queue depth and blocked time make backpressure visible |
 
 The concurrency test in `VehicleStoreTest` is not decorative: the same workload run against a
 naive `get()`-then-`put()` implementation served a stale position on 5 of 40 runs.

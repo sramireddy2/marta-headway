@@ -4,13 +4,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIOException;
 
 import dev.headway.common.VehiclePosition;
+import dev.headway.ingest.pipeline.IngestMetrics;
+import dev.headway.ingest.pipeline.ShardedPositionQueue;
 import java.io.IOException;
-import java.time.Clock;
-import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -18,14 +18,6 @@ import org.junit.jupiter.api.Test;
 class FeedPollerTest {
 
     private static final Instant T0 = Instant.parse("2026-08-14T21:00:00Z");
-
-    /**
-     * A store whose clock is frozen at {@code T0}, so the fixed-date pings below are always
-     * considered current no matter when the suite runs.
-     */
-    private static VehicleStore newStore() {
-        return new VehicleStore(Clock.fixed(T0, ZoneOffset.UTC), Duration.ofMinutes(10));
-    }
 
     private static VehiclePosition ping(String vehicleId, Instant at) {
         return new VehiclePosition(vehicleId, "15", "trip-1", 0, 33.75, -84.39, null, null, at);
@@ -57,44 +49,79 @@ class FeedPollerTest {
         }
     }
 
-    @Test
-    @DisplayName("a poll fills the store and forwards the batch downstream")
-    void pollAppliesAndForwards() throws Exception {
-        VehicleStore store = newStore();
-        List<VehiclePosition> forwarded = new ArrayList<>();
-
-        FakeFeed feed = new FakeFeed().returning(List.of(ping("bus-1", T0), ping("bus-2", T0)));
-        FeedPoller poller = new FeedPoller(feed, store, 1000, forwarded::addAll);
-
-        FeedPoller.Result result = poller.pollOnce();
-
-        assertThat(result.received()).isEqualTo(2);
-        assertThat(result.stats().created()).isEqualTo(2);
-        assertThat(store.size()).isEqualTo(2);
-        assertThat(forwarded).hasSize(2);
+    private static ShardedPositionQueue queue(IngestMetrics metrics) {
+        return new ShardedPositionQueue(2, 512, metrics);
     }
 
     @Test
-    @DisplayName("polling the same unchanged feed twice creates nothing new")
-    void repeatedPollsAreIdempotent() throws Exception {
-        VehicleStore store = newStore();
-        FakeFeed feed = new FakeFeed().returning(List.of(ping("bus-1", T0)));
-        FeedPoller poller = new FeedPoller(feed, store, 1000, positions -> {});
+    @DisplayName("a poll puts every decoded position on the queue")
+    void pollEnqueuesEverything() throws Exception {
+        IngestMetrics metrics = new IngestMetrics();
+        ShardedPositionQueue queue = queue(metrics);
+        FakeFeed feed = new FakeFeed().returning(List.of(ping("bus-1", T0), ping("bus-2", T0)));
 
-        assertThat(poller.pollOnce().stats().created()).isEqualTo(1);
-        assertThat(poller.pollOnce().stats().stale()).isEqualTo(1);
-        assertThat(store.size()).isEqualTo(1);
+        FeedPoller poller = new FeedPoller("test", feed, queue, 1000, metrics);
+        FeedPoller.Result result = poller.pollOnce();
+
+        assertThat(result.received()).isEqualTo(2);
+        assertThat(queue.depth()).isEqualTo(2);
+        assertThat(metrics.fetchedTotal()).isEqualTo(2);
+        assertThat(metrics.enqueuedTotal()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("with room in the queue the poller never blocks")
+    void doesNotBlockWhenThereIsRoom() throws Exception {
+        IngestMetrics metrics = new IngestMetrics();
+        FeedPoller poller = new FeedPoller("test",
+                new FakeFeed().returning(List.of(ping("bus-1", T0))), queue(metrics), 1000, metrics);
+
+        assertThat(poller.pollOnce().blockedMillis()).isZero();
+        assertThat(metrics.totalEnqueueWaitMillis()).isZero();
+    }
+
+    /**
+     * The poller is the producer side of backpressure. When the queue has no room it must wait,
+     * not drop and not grow the queue.
+     */
+    @Test
+    @DisplayName("a full queue makes the poller wait rather than drop positions")
+    void blocksWhenTheQueueIsFull() throws Exception {
+        IngestMetrics metrics = new IngestMetrics();
+        ShardedPositionQueue tiny = new ShardedPositionQueue(1, 2, metrics);
+        FakeFeed feed = new FakeFeed().returning(
+                List.of(ping("bus-1", T0), ping("bus-2", T0), ping("bus-3", T0)));
+        FeedPoller poller = new FeedPoller("test", feed, tiny, 1000, metrics);
+
+        // Free a slot shortly after the poll starts, so the third put unblocks.
+        Thread reader = new Thread(() -> {
+            try {
+                Thread.sleep(60);
+                tiny.poll(0, 1, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        reader.start();
+
+        FeedPoller.Result result = poller.pollOnce();
+        reader.join(2000);
+
+        assertThat(result.blockedMillis()).as("the poller was held back").isPositive();
+        assertThat(tiny.depth()).as("the bound held throughout").isLessThanOrEqualTo(2);
     }
 
     @Test
     @DisplayName("pollOnce propagates failures so callers can react")
     void pollOnceThrows() {
+        IngestMetrics metrics = new IngestMetrics();
         FakeFeed feed = new FakeFeed().failing(new IOException("feed returned HTTP 503"));
-        FeedPoller poller = new FeedPoller(feed, newStore(), 1000, positions -> {});
+        FeedPoller poller = new FeedPoller("test", feed, queue(metrics), 1000, metrics);
 
         assertThatIOException().isThrownBy(poller::pollOnce).withMessageContaining("503");
         assertThat(poller.pollsFailedTotal()).isEqualTo(1);
         assertThat(poller.consecutiveFailures()).isEqualTo(1);
+        assertThat(metrics.registry().get("headway.poll.failures").counter().count()).isEqualTo(1);
     }
 
     /**
@@ -106,8 +133,9 @@ class FeedPollerTest {
     @Test
     @DisplayName("run() swallows failures so the scheduler is never cancelled")
     void runNeverThrows() {
+        IngestMetrics metrics = new IngestMetrics();
         FakeFeed feed = new FakeFeed().failing(new IOException("network down"));
-        FeedPoller poller = new FeedPoller(feed, newStore(), 1000, positions -> {});
+        FeedPoller poller = new FeedPoller("test", feed, queue(metrics), 1000, metrics);
 
         for (int i = 0; i < 3; i++) {
             poller.run(); // must not throw
@@ -120,9 +148,9 @@ class FeedPollerTest {
     @Test
     @DisplayName("the failure streak resets after a good poll")
     void recoveryResetsTheStreak() throws Exception {
-        VehicleStore store = newStore();
+        IngestMetrics metrics = new IngestMetrics();
         FakeFeed feed = new FakeFeed().failing(new IOException("down"));
-        FeedPoller poller = new FeedPoller(feed, store, 1000, positions -> {});
+        FeedPoller poller = new FeedPoller("test", feed, queue(metrics), 1000, metrics);
 
         poller.run();
         assertThat(poller.consecutiveFailures()).isEqualTo(1);
@@ -139,8 +167,9 @@ class FeedPollerTest {
     void rateLimiterThrottles() throws Exception {
         // 20 permits/second means one every 50ms. Guava hands out the first acquire immediately,
         // so only the second one should wait.
+        IngestMetrics metrics = new IngestMetrics();
         FakeFeed feed = new FakeFeed().returning(List.of(ping("bus-1", T0)));
-        FeedPoller poller = new FeedPoller(feed, newStore(), 20.0, positions -> {});
+        FeedPoller poller = new FeedPoller("test", feed, queue(metrics), 20.0, metrics);
 
         poller.pollOnce();
         long start = System.nanoTime();

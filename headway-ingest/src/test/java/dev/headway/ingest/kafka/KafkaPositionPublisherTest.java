@@ -63,7 +63,7 @@ class KafkaPositionPublisherTest {
     void publishesWholeBatch() {
         MockProducer<String, VehiclePosition> mock = mockProducer();
         try (KafkaPositionPublisher publisher = new KafkaPositionPublisher(mock, TOPIC)) {
-            publisher.accept(List.of(ping("bus-1", "15"), ping("bus-2", "15"), ping("bus-3", "110")));
+            publisher.acceptAll(List.of(ping("bus-1", "15"), ping("bus-2", "15"), ping("bus-3", "110")));
 
             assertThat(mock.history()).hasSize(3);
             assertThat(mock.history()).allSatisfy(r -> assertThat(r.topic()).isEqualTo(TOPIC));
@@ -77,7 +77,7 @@ class KafkaPositionPublisherTest {
     void keysByRoute() {
         MockProducer<String, VehiclePosition> mock = mockProducer();
         try (KafkaPositionPublisher publisher = new KafkaPositionPublisher(mock, TOPIC)) {
-            publisher.accept(List.of(ping("bus-1", "15"), ping("bus-2", "110")));
+            publisher.acceptAll(List.of(ping("bus-1", "15"), ping("bus-2", "110")));
 
             assertThat(mock.history()).extracting(ProducerRecord::key)
                     .containsExactly("15", "110");
@@ -91,7 +91,7 @@ class KafkaPositionPublisherTest {
         VehiclePosition original = ping("bus-1", "15");
 
         try (KafkaPositionPublisher publisher = new KafkaPositionPublisher(mock, TOPIC)) {
-            publisher.accept(List.of(original));
+            publisher.accept(original);
         }
 
         // MockProducer stores the deserialised object, so re-serialise to inspect the bytes a
@@ -143,7 +143,7 @@ class KafkaPositionPublisherTest {
     void handlesEmptyBatch() {
         MockProducer<String, VehiclePosition> mock = mockProducer();
         try (KafkaPositionPublisher publisher = new KafkaPositionPublisher(mock, TOPIC)) {
-            publisher.accept(List.of());
+            publisher.acceptAll(List.of());
 
             assertThat(mock.history()).isEmpty();
             assertThat(publisher.sentTotal()).isZero();
@@ -155,7 +155,7 @@ class KafkaPositionPublisherTest {
     void closeFlushes() {
         MockProducer<String, VehiclePosition> mock = mockProducer();
         KafkaPositionPublisher publisher = new KafkaPositionPublisher(mock, TOPIC);
-        publisher.accept(List.of(ping("bus-1", "15")));
+        publisher.accept(ping("bus-1", "15"));
 
         publisher.close();
 

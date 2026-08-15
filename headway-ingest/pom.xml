@@ -43,6 +43,18 @@
       <artifactId>kafka-clients</artifactId>
     </dependency>
 
+    <!-- Counters, gauges and timers. Vendor-neutral: step 9 swaps the registry for Prometheus. -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-core</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.awaitility</groupId>
+      <artifactId>awaitility</artifactId>
+      <scope>test</scope>
+    </dependency>
+
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
