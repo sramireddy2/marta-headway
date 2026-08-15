@@ -442,6 +442,47 @@ outliers are buses assigned to a trip they have not started — deadheading to t
 `ShapeProjection.isOnRoute(maxCrossTrackMetres)` exists for exactly this; step 7 should discard
 projections beyond roughly 150 m rather than compute headways from them.
 
+### Accuracy: checked against something that shares no code
+
+Self-consistency proves the geometry is internally correct, but not that the numbers mean anything
+about the real world — a projector using the wrong distance units would still pass it. So
+`ProjectionAccuracyMain` compares two independent measurements:
+
+- **Implied speed** — the change in *our* computed distance-along-route between two sightings,
+  divided by elapsed time. Entirely our geometry and the shape file.
+- **Reported speed** — what the bus's own equipment put in the feed. Never touched by our code.
+
+```bash
+.\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests "-Dexec.mainClass=dev.headway.ingest.ProjectionAccuracyMain"
+```
+
+Two samples 75 seconds apart, 154 vehicles tracked across both:
+
+```
+implied speed over 35 m/s (physically absurd)  : 0 (0.0%)
+appeared to move backwards by more than 20 m   : 4 (2.6%)
+implied speed: median 5.30 m/s | p90 13.56 m/s | max 21.43 m/s
+
+mean implied speed  (our projection)   : 9.12 m/s
+mean reported speed (vehicle hardware) : 9.43 m/s
+correlation                            : 0.80
+absolute difference: median 2.05 m/s | p90 4.62 m/s
+```
+
+The two means agree to **3.3%**, with zero physically impossible speeds. A projector reading
+kilometres as metres, or picking wrong segments, would fail this immediately and obviously.
+
+**How to read the 2.05 m/s median difference.** MARTA quantizes reported speed to exact 5 mph
+buckets — the only values in the feed are 0.44704, 2.2352, 4.4704, 6.7056, 8.9408, 11.176,
+13.4112, 15.6464, 17.8816, 22.352 and 26.8224 m/s, which are 1, 5, 10 … 60 mph exactly. The
+reference measurement therefore carries ±1.12 m/s of quantization error before our code is
+involved, and about 43% of vehicles report no speed at all. The projection's real error is smaller
+than the number above; the comparison can only bound it.
+
+**The 2.6% that appear to move backwards** are the honest residue — loop ambiguity and shape
+mismatches. They show up as one bad sample rather than persistent drift, so step 7's windowing
+should absorb them, but they are real and not yet zero.
+
 ### Actual gaps, right now
 
 ```
