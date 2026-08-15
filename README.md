@@ -42,7 +42,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 | 2 | Scheduled polling, rate limiting, idempotent concurrent store | ✅ |
 | 3 | Kafka in Docker + producer keyed by route | ✅ |
 | 4 | Bounded sharded queue, backpressure, virtual threads, Micrometer | ✅ |
-| 5 | Static GTFS ingest (routes, trips, shapes) + Guava LoadingCache | ☐ |
+| 5 | Static GTFS (routes, trips, shapes) + Guava LoadingCache | ✅ |
 | 6 | Project GPS onto route shape → "distance along route" | ☐ |
 | 7 | Spark Structured Streaming headway computation | ☐ |
 | 8 | Bunching / gapping detection + alert topic | ☐ |
@@ -302,15 +302,93 @@ coping and one that is a single slow consumer away from stalling look identical 
 same log lines, same throughput — right up until they are not. The difference lives entirely in how
 full the queue is and how long producers spend blocked.
 
-## Known data quirks
+## The scheduled feed
 
-**MARTA's `direction_id` is not the GTFS direction.** The spec says 0 or 1 (outbound/inbound). The
-live feed yields 5, 9, 11, 14, 17 and null — no 0 or 1 at all.
+`headway-gtfs` downloads `google_transit.zip` and parses the three files the headway calculation
+needs. Check coverage against the live feed:
 
-This is not cosmetic. Headway only means something between buses travelling the *same way*; a
-northbound and a southbound bus passing each other are not consecutive, and treating them as such
-invents bunching that is not happening. Real direction has to come from joining `tripId` to the
-static GTFS `trips.txt`, which step 5 loads. Until then, nothing branches on this field.
+```bash
+.\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests "-Dexec.mainClass=dev.headway.ingest.GtfsCoverageMain"
+```
+
+```
+Loaded static GTFS in 1229ms: 86 routes, 52401 trips, 215 shapes, published 2026-06-24
+Live feed: 176 vehicles
+RESOLVED 176 of 176 vehicles (100.0%)
+  no trip_id in the realtime feed : 0
+  trip_id not in trips.txt        : 0
+  route short name not in routes  : 0
+  direction split: {direction 0=82, direction 1=94}
+   2309 -> route 2 (Donald Lee Hollowell/Ponce de Leon) | dir 0 | Candler Park Stn | shape 136095, 8.6 km
+```
+
+**100% of live vehicles resolve to a route, a direction and a path.** That was the open question
+from step 3, and it is the precondition for step 6 — a vehicle that cannot be resolved has no
+direction and no shape, so it cannot take part in a headway calculation at all.
+
+### Joining realtime to scheduled: two ids, two different answers
+
+| Realtime field | Joins to | Verified |
+|---|---|---|
+| `trip_id` | `trips.trip_id` — direct match | 6/6 sampled ids found |
+| `route_id` | `routes.route_short_name`, **not** `routes.route_id` | 9/9 matched short name, **0/9** matched route_id |
+
+A realtime bus on Clifton Road reports `route_id: "15"`. In `routes.txt` that row's `route_id` is
+`26913` and its `route_short_name` is `15`. Joining on `route_id` matches nothing — and as a left
+join it fails *silently*, enriching every route to null while the pipeline keeps running. Hence
+`GtfsSnapshot.routeForRealtimeId(...)`, named so the mistake is hard to make.
+
+### direction_id, resolved
+
+The realtime feed's `direction_id` is unusable (5, 9, 11, 14, 17, null — no 0 or 1). The static
+feed's is correct: **26,549 trips with direction 0 and 25,852 with direction 1**, nothing else. So
+direction comes from `trips.txt` via `trip_id`, and `TripContext.headwayGroup()` returns
+`route:direction` — the key that groups buses which can meaningfully bunch with each other.
+
+### Data facts worth knowing
+
+- `shape_dist_traveled` is in **kilometres**. Verified by summing haversine along shape 136092:
+  10,815 m against a final value of 10.8389, a ratio of 997.8 m per unit. Converted to metres at
+  parse time so one unit exists everywhere else.
+- All 359,676 shape points across 215 shapes are present, in sequence, and monotonic — but the
+  loader validates rather than assumes, and falls back to computing haversine distances for feeds
+  that leave the column blank.
+- `frequencies.txt` is **absent**, so scheduled headway in step 8 has to be derived from
+  `stop_times.txt` rather than read off directly.
+
+### Two performance decisions
+
+**`ZipFile`, not `ZipInputStream`.** Uncompressed the archive is ~147 MB, and 126 MB of that is
+`stop_times.txt`, which is not needed until step 8. `ZipInputStream` would decompress every entry
+in order to reach the ones we want; `ZipFile` reads the central directory and opens only the three
+we need, so `stop_times.txt` is never decompressed at all.
+
+**Shapes as three `double[]`, not a `List<Point>`.** 359,676 points as objects means 359,676 heap
+allocations reached through pointers. Three parallel primitive arrays hold the same data in ~8.6 MB
+of contiguous memory, which is what step 6's per-vehicle nearest-segment scan will walk.
+
+### Caching: `refreshAfterWrite` vs `expireAfterWrite`
+
+The zip is cached on disk and re-fetched with a **conditional GET** — `If-Modified-Since` against
+MARTA's `Last-Modified`. A `304` costs a few hundred bytes instead of 21 MB, and unlike a
+once-a-day timer it stays correct whether the agency publishes twice in a day or not at all for a
+month.
+
+In memory it sits in a single-entry Guava `LoadingCache`, with **both** deadlines set:
+
+- **`expireAfterWrite(24h)`** invalidates the entry, so the next caller *blocks* while it reloads —
+  here that means a 21 MB download plus a 360,000-point parse, seconds of stall.
+- **`refreshAfterWrite(6h)`** keeps serving the existing snapshot and reloads in the background.
+  Nobody blocks; one thread does the work.
+
+Refresh at 6h is the normal path; expire at 24h is the backstop so repeated refresh failures
+eventually surface instead of serving a week-old schedule forever.
+
+One subtlety: Guava's default `CacheLoader.reload()` is **synchronous** — it just calls `load()` on
+the triggering thread, so plain `refreshAfterWrite` still blocks somebody. Making it genuinely
+async requires overriding `reload()` to return a `ListenableFuture`, which
+`GtfsStaticRepository` does. A failed refresh returns the previous snapshot rather than throwing,
+so a MARTA outage degrades to "slightly stale", never to "no schedule".
 
 ## Concurrency notes
 
@@ -358,8 +436,13 @@ The broker is not up. `docker compose up -d`, then wait for `docker compose ps` 
 ```
 headway-parent          the root pom: dependency versions, Java level, module list
 ├── headway-common      domain model + the JSON contract (VehiclePosition, Json)
+├── headway-gtfs        the scheduled feed: routes, trips, shapes, cached and refreshed
 └── headway-ingest      polls GTFS-Realtime, decodes protobuf, publishes to Kafka
 ```
+
+`headway-gtfs` deliberately does **not** depend on `headway-common`: it knows about the scheduled
+feed and nothing about realtime vehicle positions, so it can be tested and reused on its own. The
+two worlds meet in `headway-ingest`, which depends on both.
 
 `headway-common` deliberately has **no** Kafka dependency. The domain model defines what a vehicle
 position *is* and how it is written as JSON; how those bytes get transported is the ingest module's
@@ -378,6 +461,8 @@ separate classpaths and no version war.
 | Vehicle positions (realtime) | `https://gtfs-rt.itsmarta.com/TMGTFSRealTimeWebService/vehicle/vehiclepositions.pb` | GTFS-RT protobuf |
 | Trip updates (realtime) | `https://gtfs-rt.itsmarta.com/TMGTFSRealTimeWebService/tripupdate/tripupdates.pb` | GTFS-RT protobuf |
 | Static schedule | `https://www.itsmarta.com/google_transit_feed/google_transit.zip` | GTFS (zip of CSVs) |
+
+The static zip is 21 MB (≈147 MB uncompressed) and is cached under `data/`, which is gitignored.
 
 No API key required. Be polite: poll no faster than every 15 seconds (step 2 enforces this with a
 rate limiter).

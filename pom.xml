@@ -14,6 +14,7 @@
 
   <modules>
     <module>headway-common</module>
+    <module>headway-gtfs</module>
     <module>headway-ingest</module>
   </modules>
 
@@ -32,6 +33,7 @@
 
     <gtfs.rt.bindings.version>0.2.0</gtfs.rt.bindings.version>
     <guava.version>33.6.0-jre</guava.version>
+    <commons.csv.version>1.14.1</commons.csv.version>
     <jackson.version>2.22.1</jackson.version>
     <kafka.version>4.3.1</kafka.version>
     <micrometer.version>1.17.0</micrometer.version>
@@ -53,6 +55,17 @@
         <groupId>dev.headway</groupId>
         <artifactId>headway-common</artifactId>
         <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>dev.headway</groupId>
+        <artifactId>headway-gtfs</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-csv</artifactId>
+        <version>${commons.csv.version}</version>
       </dependency>
 
       <dependency>

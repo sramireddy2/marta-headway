@@ -25,6 +25,10 @@
       <groupId>dev.headway</groupId>
       <artifactId>headway-common</artifactId>
     </dependency>
+    <dependency>
+      <groupId>dev.headway</groupId>
+      <artifactId>headway-gtfs</artifactId>
+    </dependency>
 
     <!-- Generated Java classes for the GTFS-Realtime protobuf schema. -->
     <dependency>
