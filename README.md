@@ -47,7 +47,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 | 7 | Spark Structured Streaming headway computation | ✅ |
 | 8 | Bunching / gapping detection + alert topic | ✅ |
 | 9 | Spring Boot REST + WebSocket API | ✅ |
-| 10 | Leaflet live map front-end | ☐ |
+| 10 | Leaflet live map front-end | ✅ |
 | 11 | Concurrency hardening (StampedLock / Striped locks) + benchmarks | ☐ |
 
 ---
@@ -816,6 +816,7 @@ are a property of the log, not of reality, so collapsing them belongs here.
 | `GET /api/snapshot` | exactly what a WebSocket frame contains, for anything that would rather poll |
 | `GET /api/status` | the counters that distinguish "quiet network" from "broken pipeline" |
 | `ws://…/ws/live` | a full snapshot on connect, then one per second |
+| `GET /` | the live map — see [The map](#the-map-step-10) |
 
 ### Episodes: the duplicate-alert fix
 
@@ -917,6 +918,83 @@ GET /api/alerts   17 open episodes, worst first:
 WebSocket verified from a real browser: full snapshot on connect, then one ~84 KB frame per second
 — 48 routes, 20 episodes, 179 buses per frame.
 
+## The map (step 10)
+
+Open **<http://localhost:8080/>** with the stack running. Three static files served off the
+classpath by the same Spring Boot app — no build step, no bundler, no framework.
+
+Buses are coloured by the verdict for their route and direction; the two named in an alert get a
+white ring. The panel lists **events, not measurements** — the same collapse `AlertTracker` does,
+made visible: a row reading `20 windows` is twenty overlapping window measurements behind one line.
+Clicking a row frames the two buses involved. Clicking a bus explains it.
+
+### Deriving a bus's colour, backwards
+
+A vehicle position has a `routeId` but no usable direction — MARTA's `directionId` is not the GTFS
+0/1 flag — so a bus cannot say which headway group it belongs to. The mapping only runs one way:
+each route record already lists the vehicles it measured, in order, so inverting
+`orderedVehicles` gives every bus its group's verdict without guessing. Buses in no measured group
+stay grey, which is honest: "not currently being compared to anything" is not the same as "fine".
+
+### The two things that actually matter in the client
+
+**Reuse markers, never recreate them.** 180 buses at one frame a second is 10,800 objects a minute
+if each frame rebuilds the layer. Markers live in a `Map` keyed by vehicle id and move with
+`setLatLng`; only buses that left the feed are removed. Rebuilding would also slam shut any popup
+mid-read. Same reasoning for the alert list, which is rebuilt only when a signature of its visible
+fields changes — an episode quietly absorbing another window is exactly the case that should *not*
+disturb the display.
+
+**Back off when reconnecting.** The server going down is precisely when every open tab tries to
+reconnect. Retrying in a tight loop turns one restart into a stampede against a process that is
+still starting. Exponential backoff to 15s, and a watchdog that reports `stale` if frames stop
+arriving for five seconds — a TCP connection can be dead while still looking open, and a green
+light over a frozen map is a lie.
+
+### A bug the hidden pane exposed
+
+The first automated check reported a correctly sized 1100×844 map container with a **0×0 Leaflet
+canvas**. Not a rendering bug in the page — `document.hidden` was true and zero animation frames
+fired in half a second, so Leaflet's deferred sizing never ran.
+
+That is an artifact of the test environment, but it points at a real defect: Leaflet measures its
+container once and afterwards only on a *window* resize. Load this page in a background tab and the
+same suspension applies; switching to the tab fires no resize event, so nothing corrects it and the
+map stays empty. Collapsing the alert panel changes the map's width without changing the window's
+at all. A `ResizeObserver` on the element plus a `visibilitychange` handler covers both — the fix
+for the most common Leaflet complaint there is, *"the map is blank until I resize the window"*.
+
+> **Editing the static files while `spring-boot:run` is up does nothing.** They are served from
+> `target/classes`, which is populated at build time. Restart the app (or re-run `package`) after
+> changing `index.html`, `app.js` or `style.css`. Hard-reloading the browser will not help — the
+> server is genuinely still serving the old bytes.
+
+### Leaflet is pinned and hash-checked
+
+`leaflet@1.9.4` with a Subresource Integrity hash on both the CSS and the JS. Version-pinning alone
+is not enough — `leaflet@1` would silently take a new minor — and an SRI hash makes the browser
+refuse a file whose bytes changed at all. The hashes were computed from the downloaded files rather
+than copied from somewhere, which is the only way an integrity hash means anything. Tiles come from
+CARTO's free dark basemap over OpenStreetMap data, attributed in the corner.
+
+### It works
+
+Verified against the live feed in a real browser: 177 buses, 45 route-directions, 9–11 alerts,
+socket `live`. Route 83 was watched through a full episode — it opened at `severe bunching`, was
+absorbed across 20 windows, and appeared as `severe bunching → bunching` while recovering. When it
+cleared, the row disappeared and both buses turned green. Clicking bus 3621 a minute later:
+
+```
+Bus 3621
+Route         83 — Campbellton Road
+Status        on schedule
+Spacing       0.57× scheduled
+Closest gap   3.5 km of 6.2 km
+Seen          28s ago
+```
+
+That is the same bus, the whole pipeline, and the entire point of the project in one popup.
+
 ## Troubleshooting
 
 **`Failed to clean project: Failed to delete ...headway-common-0.1.0-SNAPSHOT.jar`**
@@ -942,6 +1020,7 @@ headway-parent          the root pom: dependency versions, Java level, module li
 ├── headway-ingest      polls GTFS-Realtime, decodes protobuf, publishes to Kafka
 ├── headway-stream      Spark job: Kafka -> windowed headways -> Kafka
 └── headway-api         Spring Boot: Kafka -> in-memory state -> REST + WebSocket
+                        (and src/main/resources/static: the Leaflet map)
 ```
 
 `headway-gtfs` deliberately does **not** depend on `headway-common`: it knows about the scheduled

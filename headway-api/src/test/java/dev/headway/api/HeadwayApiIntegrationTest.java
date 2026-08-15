@@ -232,6 +232,27 @@ class HeadwayApiIntegrationTest {
         assertThat(status.newestWindowEnd()).isNotNull();
     }
 
+    /**
+     * The map is static files served off the classpath, so the failure mode is not a stack trace —
+     * it is a 404 that nobody notices until they open a browser. Worth three assertions.
+     */
+    @Test
+    @DisplayName("the live map is served at the root")
+    void mapIsServed() {
+        ResponseEntity<String> page = rest.getForEntity("/", String.class);
+
+        assertThat(page.getStatusCode().is2xxSuccessful()).isTrue();
+        assertThat(page.getBody()).contains("<title>Headway");
+
+        for (String asset : new String[] {"/app.js", "/style.css"}) {
+            assertThat(rest.getForEntity(asset, String.class).getStatusCode().is2xxSuccessful())
+                    .as(asset).isTrue();
+        }
+
+        // The page and the server have to agree on the socket path; nothing else checks it.
+        assertThat(rest.getForObject("/app.js", String.class)).contains("/ws/live");
+    }
+
     @Test
     @DisplayName("both consumers subscribed to the configured topics")
     void wiring() {

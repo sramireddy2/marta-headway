@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Headway — MARTA bunching, live</title>
+
+<!--
+  Leaflet from a CDN, pinned to an exact version and guarded by a Subresource Integrity hash.
+
+  The version pin alone is not enough. `leaflet@1` would silently pick up a new minor release; an
+  SRI hash means the browser refuses to run the file at all if its bytes differ by one character
+  from what was reviewed. That turns "the CDN was compromised" from a silent takeover of a page
+  showing operational data into a page that simply does not load.
+
+  These hashes were computed from the downloaded files, not copied from a blog post - which is the
+  only way an integrity hash is worth anything.
+-->
+<link rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H"
+      crossorigin="anonymous">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header id="bar">
+  <h1>Headway<span class="sub">MARTA bunching, live</span></h1>
+
+  <div class="stats">
+    <div class="stat"><b id="stat-buses">–</b><span>buses</span></div>
+    <div class="stat"><b id="stat-routes">–</b><span>routes</span></div>
+    <div class="stat alerting"><b id="stat-alerts">–</b><span>alerts</span></div>
+  </div>
+
+  <div id="conn" class="conn connecting">
+    <i></i><span id="conn-text">connecting</span>
+  </div>
+</header>
+
+<main>
+  <div id="map"></div>
+
+  <aside id="panel">
+    <div class="panel-head">
+      <h2>Active alerts</h2>
+      <!--
+        Explaining the count is not decoration. The alert topic carries one record per window, so
+        the same event appears in it six or more times; the number here is events, not records, and
+        a reader who does not know that will think the dashboard is dropping alerts.
+      -->
+      <p class="hint">One row per <em>event</em>, not per measurement. Click to locate.</p>
+    </div>
+    <ul id="alerts"></ul>
+    <div id="alerts-empty" class="empty">Nothing bunched right now.</div>
+
+    <div class="legend">
+      <div><i class="sw severe-bunching"></i> severe bunching <span>&le; 0.25&times;</span></div>
+      <div><i class="sw bunching"></i> bunching <span>&le; 0.5&times;</span></div>
+      <div><i class="sw on-schedule"></i> on schedule</div>
+      <div><i class="sw gapping"></i> gapping <span>&ge; 1.5&times;</span></div>
+      <div><i class="sw severe-gapping"></i> severe gapping <span>&ge; 2.5&times;</span></div>
+      <div><i class="sw layover"></i> layover / unknown</div>
+      <p class="hint">Ratio of observed spacing to what the timetable implies.</p>
+    </div>
+  </aside>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH"
+        crossorigin="anonymous"></script>
+<script src="app.js"></script>
+</body>
+</html>
