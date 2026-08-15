@@ -5,10 +5,7 @@ import dev.headway.gtfs.ShapeProjection;
 import dev.headway.gtfs.ShapeProjector;
 import dev.headway.gtfs.TripContext;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Row;
@@ -100,61 +97,27 @@ final class HeadwayFunctions {
      */
     static UserDefinedFunction gapsUdf() {
         UDF1<Object, Row> fn = sightings -> {
-            List<Row> rows = toRowList(sightings);
-
-            // 1. newest reading per vehicle
-            Map<String, Row> latest = new HashMap<>();
-            for (Row row : rows) {
-                String vehicleId = row.getAs("vehicleId");
-                Row previous = latest.get(vehicleId);
-                if (previous == null || timestampOf(row) > timestampOf(previous)) {
-                    latest.put(vehicleId, row);
-                }
+            List<HeadwayGaps.Sighting> parsed = new ArrayList<>();
+            for (Row row : toRowList(sightings)) {
+                parsed.add(new HeadwayGaps.Sighting(
+                        row.getAs("vehicleId"),
+                        row.<Double>getAs("distanceMetres"),
+                        timestampOf(row)));
             }
 
-            // 2. order along the route
-            List<Row> ordered = new ArrayList<>(latest.values());
-            ordered.sort(Comparator.comparingDouble(r -> r.<Double>getAs("distanceMetres")));
-
-            List<String> vehicleIds = new ArrayList<>(ordered.size());
-            List<Double> distances = new ArrayList<>(ordered.size());
-            for (Row row : ordered) {
-                vehicleIds.add(row.getAs("vehicleId"));
-                distances.add(row.getAs("distanceMetres"));
-            }
-
-            // 3. differences between neighbours
-            List<Double> gaps = new ArrayList<>(Math.max(0, ordered.size() - 1));
-            for (int i = 1; i < distances.size(); i++) {
-                gaps.add(distances.get(i) - distances.get(i - 1));
-            }
-
-            Double min = gaps.isEmpty() ? null : gaps.stream().min(Double::compare).orElseThrow();
-            Double max = gaps.isEmpty() ? null : gaps.stream().max(Double::compare).orElseThrow();
-            Double mean = gaps.isEmpty() ? null
-                    : gaps.stream().mapToDouble(Double::doubleValue).average().orElseThrow();
-            Double median = median(gaps);
+            HeadwayGaps.Result result = HeadwayGaps.compute(parsed);
 
             return RowFactory.create(
-                    ordered.size(),
-                    gaps.toArray(new Double[0]),
-                    min, median, max, mean,
-                    vehicleIds.toArray(new String[0]),
-                    distances.toArray(new Double[0]));
+                    result.vehicleCount(),
+                    result.gapsMetres().toArray(new Double[0]),
+                    result.minGapMetres(),
+                    result.medianGapMetres(),
+                    result.maxGapMetres(),
+                    result.meanGapMetres(),
+                    result.orderedVehicles().toArray(new String[0]),
+                    result.orderedDistancesMetres().toArray(new Double[0]));
         };
         return functions.udf(fn, HeadwaySchema.HEADWAYS);
-    }
-
-    private static Double median(List<Double> values) {
-        if (values.isEmpty()) {
-            return null;
-        }
-        List<Double> sorted = new ArrayList<>(values);
-        sorted.sort(Double::compare);
-        int middle = sorted.size() / 2;
-        return sorted.size() % 2 == 1
-                ? sorted.get(middle)
-                : (sorted.get(middle - 1) + sorted.get(middle)) / 2.0;
     }
 
     private static long timestampOf(Row row) {

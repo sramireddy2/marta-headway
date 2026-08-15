@@ -641,6 +641,28 @@ alert can name *which* two buses are too close:
 Only batch 0 fell behind the 30 s trigger (36 s — JIT warmup plus broadcasting the shapes);
 batches 1–5 kept up.
 
+### Tests
+
+The headway arithmetic — deduplicate, order, difference — lives in `HeadwayGaps`, a plain Java
+class with no Spark in it. That separation is the point: a bug there silently produces wrong
+headways, and leaving it inside a UDF would mean the only way to test it was to stand up a
+`SparkSession`, which is slow enough that in practice it does not get tested at all.
+
+- **`HeadwayGapsTest`** — 20 tests, 0.3 s, no Spark. The load-bearing one is
+  `oneBusIsNotAConvoy`: four sightings of a single bus in one window must produce **zero** gaps.
+  Skip the dedupe and you measure the distance between a bus and itself moments earlier, and every
+  route reports severe bunching forever.
+- **`HeadwayFunctionsSparkTest`** — 6 tests through a real DataFrame, covering what the pure tests
+  cannot: Catalyst `Row` conversion, broadcasting the schedule, the declared JSON schema against a
+  message copied from the live topic, and the sharp edge where an array column arrives as a
+  `scala.collection.Seq` rather than a `List` (a runtime `ClassCastException`, never a compile
+  error). Batch, not streaming, since checkpointing is exactly what does not work on Windows.
+
+These caught a real latent bug immediately: pinning `scala-library` to 2.13.16 when Spark 4.1.3 is
+built against 2.13.17 throws `NoSuchMethodError: MurmurHash3$.caseClassHash` the moment a
+`SparkSession` is created. Scala's standard library is not binary compatible across patch releases
+in the way the version number suggests.
+
 ### A finding that step 8 has to handle
 
 Route 89 direction 0 reported a 38.1 m gap in every window. Pulling the full record:
