@@ -18,6 +18,7 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.expressions.UserDefinedFunction;
+import org.apache.spark.sql.functions;
 import org.apache.spark.sql.streaming.OutputMode;
 import org.apache.spark.sql.streaming.StreamingQuery;
 import org.apache.spark.sql.streaming.Trigger;
@@ -73,6 +74,7 @@ public final class HeadwayStreamMain {
         String bootstrap = env("HEADWAY_KAFKA_BOOTSTRAP", "localhost:9092");
         String sourceTopic = env("HEADWAY_KAFKA_TOPIC", "vehicle-positions");
         String sinkTopic = env("HEADWAY_HEADWAY_TOPIC", "route-headways");
+        String alertTopic = env("HEADWAY_ALERT_TOPIC", "headway-alerts");
         String startingOffsets = env("HEADWAY_STARTING_OFFSETS", "latest");
         // Configurable because the working directory differs between a local run and the
         // container, where these are bind-mounted at /data.
@@ -101,7 +103,7 @@ public final class HeadwayStreamMain {
                             scala.reflect.ClassTag$.MODULE$.apply(GtfsSnapshot.class));
 
             UserDefinedFunction project = HeadwayFunctions.projectUdf(gtfs);
-            UserDefinedFunction gaps = HeadwayFunctions.gapsUdf();
+            UserDefinedFunction gaps = HeadwayFunctions.gapsUdf(gtfs);
 
             Dataset<Row> raw = spark.readStream()
                     .format("kafka")
@@ -146,8 +148,12 @@ public final class HeadwayStreamMain {
                             col("routeLongName"),
                             col("directionId"))
                     .agg(collect_list(struct(
-                            col("vehicleId"), col("distanceMetres"), col("ts"))).as("sightings"))
-                    .withColumn("h", gaps.apply(col("sightings")))
+                                    col("vehicleId"), col("distanceMetres"), col("ts")))
+                                    .as("sightings"),
+                            functions.max(col("shapeLengthMetres")).as("routeLengthMetres"))
+                    .withColumn("h", gaps.apply(
+                            col("sightings"), col("headwayGroup"),
+                            col("routeLengthMetres"), col("w.end")))
                     .select(
                             col("w.start").as("windowStart"),
                             col("w.end").as("windowEnd"),
@@ -155,6 +161,7 @@ public final class HeadwayStreamMain {
                             col("routeShortName"),
                             col("routeLongName"),
                             col("directionId"),
+                            col("routeLengthMetres"),
                             col("h.vehicleCount").as("vehicleCount"),
                             col("h.minGapMetres").as("minGapMetres"),
                             col("h.medianGapMetres").as("medianGapMetres"),
@@ -162,7 +169,15 @@ public final class HeadwayStreamMain {
                             col("h.meanGapMetres").as("meanGapMetres"),
                             col("h.gapsMetres").as("gapsMetres"),
                             col("h.orderedVehicles").as("orderedVehicles"),
-                            col("h.orderedDistancesMetres").as("orderedDistancesMetres"))
+                            col("h.orderedDistancesMetres").as("orderedDistancesMetres"),
+                            col("h.layoverVehicles").as("layoverVehicles"),
+                            col("h.scheduledHeadwaySeconds").as("scheduledHeadwaySeconds"),
+                            col("h.expectedSpacingMetres").as("expectedSpacingMetres"),
+                            col("h.averageSpeedMps").as("averageSpeedMps"),
+                            col("h.observedHeadwaySeconds").as("observedHeadwaySeconds"),
+                            col("h.headwayRatio").as("headwayRatio"),
+                            col("h.status").as("status"),
+                            col("h.worstPairVehicles").as("worstPairVehicles"))
                     // A single bus has nobody to have a gap with.
                     .filter(col("vehicleCount").geq(2));
 
@@ -195,22 +210,57 @@ public final class HeadwayStreamMain {
                             long groups = batch.count();
                             System.out.printf("%n=== batch %d: %d route-direction groups with 2+ buses ===%n",
                                     batchId, groups);
-                            if (groups > 0) {
-                                batch.select(col("windowEnd"), col("headwayGroup"),
-                                                col("routeLongName"), col("vehicleCount"),
-                                                col("minGapMetres"), col("medianGapMetres"),
-                                                col("maxGapMetres"))
-                                        .orderBy(col("minGapMetres"))
-                                        .show(12, false);
-
-                                batch.select(col("headwayGroup").as("key"),
-                                                to_json(struct(col("*"))).as("value"))
-                                        .write()
-                                        .format("kafka")
-                                        .option("kafka.bootstrap.servers", bootstrap)
-                                        .option("topic", sinkTopic)
-                                        .save();
+                            if (groups == 0) {
+                                return;
                             }
+
+                            // Only the four alertable statuses reach a dispatcher. ON_SCHEDULE and
+                            // LAYOVER are the overwhelming majority, and an alert feed that
+                            // includes them is one nobody reads.
+                            Dataset<Row> alerts = batch.filter(
+                                    col("status").isin("SEVERE_BUNCHING", "BUNCHING",
+                                            "GAPPING", "SEVERE_GAPPING"));
+                            alerts.persist();
+
+                            try {
+                                long alertCount = alerts.count();
+                                System.out.printf("    %d alerts%n", alertCount);
+
+                                if (alertCount > 0) {
+                                    alerts.select(col("headwayGroup"), col("routeLongName"),
+                                                    col("status"), col("vehicleCount"),
+                                                    functions.round(col("minGapMetres"), 0).as("gap_m"),
+                                                    functions.round(col("expectedSpacingMetres"), 0)
+                                                            .as("expected_m"),
+                                                    functions.round(col("headwayRatio"), 2).as("ratio"),
+                                                    functions.round(
+                                                            col("scheduledHeadwaySeconds").divide(60), 1)
+                                                            .as("sched_min"),
+                                                    col("worstPairVehicles").as("buses"))
+                                            .orderBy(col("headwayRatio"))
+                                            .show(12, false);
+
+                                    alerts.select(col("headwayGroup").as("key"),
+                                                    to_json(struct(col("*"))).as("value"))
+                                            .write()
+                                            .format("kafka")
+                                            .option("kafka.bootstrap.servers", bootstrap)
+                                            .option("topic", alertTopic)
+                                            .save();
+                                }
+                            } finally {
+                                alerts.unpersist();
+                            }
+
+                            // The full headway feed still goes out; alerts are a filtered view of
+                            // it, not a replacement.
+                            batch.select(col("headwayGroup").as("key"),
+                                            to_json(struct(col("*"))).as("value"))
+                                    .write()
+                                    .format("kafka")
+                                    .option("kafka.bootstrap.servers", bootstrap)
+                                    .option("topic", sinkTopic)
+                                    .save();
                         } finally {
                             batch.unpersist();
                         }

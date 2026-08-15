@@ -18,6 +18,7 @@ import java.util.Objects;
 public record GtfsTrip(
         String tripId,
         String routeId,
+        String serviceId,
         int directionId,
         String shapeId,
         String headsign) implements java.io.Serializable {

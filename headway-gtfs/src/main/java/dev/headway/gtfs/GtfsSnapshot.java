@@ -28,6 +28,8 @@ public final class GtfsSnapshot implements java.io.Serializable {
     private final ImmutableMap<String, GtfsRoute> routesByShortName;
     private final ImmutableMap<String, GtfsTrip> tripsById;
     private final ImmutableMap<String, RouteShape> shapesById;
+    private final ServiceCalendar calendar;
+    private final ScheduleIndex schedule;
     private final Instant loadedAt;
     private final Instant feedLastModified;
 
@@ -35,14 +37,27 @@ public final class GtfsSnapshot implements java.io.Serializable {
                  ImmutableMap<String, GtfsRoute> routesByShortName,
                  ImmutableMap<String, GtfsTrip> tripsById,
                  ImmutableMap<String, RouteShape> shapesById,
+                 ServiceCalendar calendar,
+                 ScheduleIndex schedule,
                  Instant loadedAt,
                  Instant feedLastModified) {
         this.routesByStaticId = routesByStaticId;
         this.routesByShortName = routesByShortName;
         this.tripsById = tripsById;
         this.shapesById = shapesById;
+        this.calendar = calendar;
+        this.schedule = schedule;
         this.loadedAt = loadedAt;
         this.feedLastModified = feedLastModified;
+    }
+
+    /** What the timetable says, for comparing observed gaps against. */
+    public ScheduleIndex schedule() {
+        return schedule;
+    }
+
+    public ServiceCalendar calendar() {
+        return calendar;
     }
 
     /**
@@ -137,7 +152,8 @@ public final class GtfsSnapshot implements java.io.Serializable {
 
     @Override
     public String toString() {
-        return "GtfsSnapshot[%d routes, %d trips, %d shapes, feed published %s]"
-                .formatted(routeCount(), tripCount(), shapeCount(), feedLastModified);
+        return "GtfsSnapshot[%d routes, %d trips, %d shapes, %d scheduled groups, feed published %s]"
+                .formatted(routeCount(), tripCount(), shapeCount(),
+                        schedule == null ? 0 : schedule.groupCount(), feedLastModified);
     }
 }

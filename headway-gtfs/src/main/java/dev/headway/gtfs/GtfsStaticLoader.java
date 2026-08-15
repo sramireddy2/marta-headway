@@ -63,12 +63,17 @@ public final class GtfsStaticLoader {
 
             Map<String, GtfsTrip> trips = readTrips(zip);
             Map<String, RouteShape> shapes = readShapes(zip);
+            ServiceCalendar calendar = readCalendar(zip);
+            ScheduleIndex schedule =
+                    readSchedule(zip, trips, shapes, byStaticId, byShortName, calendar);
 
             GtfsSnapshot snapshot = new GtfsSnapshot(
                     ImmutableMap.copyOf(byStaticId),
                     ImmutableMap.copyOf(byShortName),
                     ImmutableMap.copyOf(trips),
                     ImmutableMap.copyOf(shapes),
+                    calendar,
+                    schedule,
                     Instant.now(),
                     feedLastModified);
 
@@ -131,8 +136,8 @@ public final class GtfsStaticLoader {
                 }
 
                 trips.put(tripId, new GtfsTrip(
-                        tripId, row.get("route_id"), direction, shapeId,
-                        get(row, "trip_headsign", "")));
+                        tripId, row.get("route_id"), get(row, "service_id", ""),
+                        direction, shapeId, get(row, "trip_headsign", "")));
             }
         }
         if (skipped > 0) {
@@ -222,6 +227,179 @@ public final class GtfsStaticLoader {
                     + "(shape_dist_traveled missing or non-monotonic)", computed, shapes.size());
         }
         return shapes;
+    }
+
+    /**
+     * Reads {@code calendar.txt} and {@code calendar_dates.txt}.
+     *
+     * <p>Both are optional in the GTFS spec. A feed with neither gets a permissive calendar rather
+     * than an exception, so this module keeps working against agencies that structure things
+     * differently.
+     */
+    private ServiceCalendar readCalendar(ZipFile zip) throws IOException {
+        Map<String, ServiceCalendar.WeeklyService> weekly = new HashMap<>();
+        Map<java.time.LocalDate, java.util.Set<String>> added = new HashMap<>();
+        Map<java.time.LocalDate, java.util.Set<String>> removed = new HashMap<>();
+
+        if (zip.getEntry("calendar.txt") != null) {
+            try (CSVParser parser = open(zip, "calendar.txt")) {
+                for (CSVRecord row : parser) {
+                    java.util.EnumSet<java.time.DayOfWeek> days =
+                            java.util.EnumSet.noneOf(java.time.DayOfWeek.class);
+                    addDay(days, row, "monday", java.time.DayOfWeek.MONDAY);
+                    addDay(days, row, "tuesday", java.time.DayOfWeek.TUESDAY);
+                    addDay(days, row, "wednesday", java.time.DayOfWeek.WEDNESDAY);
+                    addDay(days, row, "thursday", java.time.DayOfWeek.THURSDAY);
+                    addDay(days, row, "friday", java.time.DayOfWeek.FRIDAY);
+                    addDay(days, row, "saturday", java.time.DayOfWeek.SATURDAY);
+                    addDay(days, row, "sunday", java.time.DayOfWeek.SUNDAY);
+
+                    weekly.put(row.get("service_id"), new ServiceCalendar.WeeklyService(
+                            row.get("service_id"), days,
+                            parseGtfsDate(get(row, "start_date", "19700101")),
+                            parseGtfsDate(get(row, "end_date", "20991231"))));
+                }
+            }
+        }
+
+        if (zip.getEntry("calendar_dates.txt") != null) {
+            try (CSVParser parser = open(zip, "calendar_dates.txt")) {
+                for (CSVRecord row : parser) {
+                    java.time.LocalDate date = parseGtfsDate(row.get("date"));
+                    String serviceId = row.get("service_id");
+                    // 1 = service added on this date, 2 = removed. Anything else is malformed.
+                    if ("1".equals(get(row, "exception_type", ""))) {
+                        added.computeIfAbsent(date, d -> new java.util.HashSet<>()).add(serviceId);
+                    } else if ("2".equals(get(row, "exception_type", ""))) {
+                        removed.computeIfAbsent(date, d -> new java.util.HashSet<>()).add(serviceId);
+                    }
+                }
+            }
+        }
+
+        if (weekly.isEmpty() && added.isEmpty()) {
+            log.warn("No calendar.txt or calendar_dates.txt; every service will be treated as active");
+            return ServiceCalendar.permissive();
+        }
+
+        Map<java.time.LocalDate, com.google.common.collect.ImmutableSet<String>> addedImmutable =
+                new HashMap<>();
+        added.forEach((d, s) -> addedImmutable.put(d, com.google.common.collect.ImmutableSet.copyOf(s)));
+        Map<java.time.LocalDate, com.google.common.collect.ImmutableSet<String>> removedImmutable =
+                new HashMap<>();
+        removed.forEach((d, s) -> removedImmutable.put(d, com.google.common.collect.ImmutableSet.copyOf(s)));
+
+        log.info("Calendar: {} weekly services, {} dates with additions, {} with removals",
+                weekly.size(), added.size(), removed.size());
+        return new ServiceCalendar(weekly, addedImmutable, removedImmutable);
+    }
+
+    private static void addDay(java.util.Set<java.time.DayOfWeek> days, CSVRecord row,
+                               String column, java.time.DayOfWeek day) {
+        if ("1".equals(get(row, column, "0"))) {
+            days.add(day);
+        }
+    }
+
+    /** GTFS dates are {@code YYYYMMDD} with no separators. */
+    private static java.time.LocalDate parseGtfsDate(String raw) {
+        String value = raw.trim();
+        return java.time.LocalDate.of(
+                Integer.parseInt(value.substring(0, 4)),
+                Integer.parseInt(value.substring(4, 6)),
+                Integer.parseInt(value.substring(6, 8)));
+    }
+
+    /**
+     * Builds the scheduled-headway index from {@code stop_times.txt}.
+     *
+     * <h2>Reading 126 MB to keep 52,000 numbers</h2>
+     *
+     * {@code stop_times.txt} is 2,415,219 rows and by far the largest file in the feed. All this
+     * needs from it is, per trip, the departure from the first stop and the arrival at the last —
+     * two rows out of the forty-odd each trip contributes.
+     *
+     * <p>So it is streamed and reduced on the fly rather than collected: one pass, tracking the
+     * lowest and highest {@code stop_sequence} seen per trip. Peak memory is one small array per
+     * trip instead of a list of 2.4 million parsed rows, and nothing but the first and last times
+     * survives the pass.
+     */
+    private ScheduleIndex readSchedule(ZipFile zip,
+                                       Map<String, GtfsTrip> trips,
+                                       Map<String, RouteShape> shapes,
+                                       Map<String, GtfsRoute> routesByStaticId,
+                                       Map<String, GtfsRoute> routesByShortName,
+                                       ServiceCalendar calendar) throws IOException {
+        if (zip.getEntry("stop_times.txt") == null) {
+            log.warn("No stop_times.txt; scheduled headways will be unavailable");
+            return new ScheduleIndex(Map.of(), calendar);
+        }
+
+        long start = System.nanoTime();
+        // tripId -> {minSequence, startSeconds, maxSequence, endSeconds}
+        Map<String, int[]> bounds = new HashMap<>(trips.size() * 2);
+        long rows = 0;
+
+        try (CSVParser parser = open(zip, "stop_times.txt")) {
+            for (CSVRecord row : parser) {
+                rows++;
+                String tripId = row.get("trip_id");
+                if (!trips.containsKey(tripId)) {
+                    continue; // a trip we already discarded for having no shape or direction
+                }
+                int sequence = parseInt(row.get("stop_sequence"), -1);
+                if (sequence < 0) {
+                    continue;
+                }
+                int departure = ScheduledTrip.parseGtfsTime(get(row, "departure_time", ""));
+                int arrival = ScheduledTrip.parseGtfsTime(get(row, "arrival_time", ""));
+                int time = departure >= 0 ? departure : arrival;
+                if (time < 0) {
+                    continue; // interpolated stop with no published time
+                }
+
+                int[] entry = bounds.get(tripId);
+                if (entry == null) {
+                    bounds.put(tripId, new int[] {sequence, time, sequence, time});
+                    continue;
+                }
+                if (sequence < entry[0]) {
+                    entry[0] = sequence;
+                    entry[1] = time;
+                }
+                if (sequence > entry[2]) {
+                    entry[2] = sequence;
+                    entry[3] = time;
+                }
+            }
+        }
+
+        Map<String, List<ScheduledTrip>> byGroup = new HashMap<>();
+        int skipped = 0;
+        for (Map.Entry<String, int[]> entry : bounds.entrySet()) {
+            GtfsTrip trip = trips.get(entry.getKey());
+            int[] value = entry.getValue();
+            if (value[3] <= value[1]) {
+                skipped++;
+                continue; // no measurable duration
+            }
+            RouteShape shape = shapes.get(trip.shapeId());
+            GtfsRoute route = routesByStaticId.get(trip.routeId());
+            if (shape == null || route == null || route.shortName().isEmpty()) {
+                skipped++;
+                continue;
+            }
+            String group = route.shortName() + ":" + trip.directionId();
+            byGroup.computeIfAbsent(group, g -> new ArrayList<>()).add(new ScheduledTrip(
+                    trip.tripId(), trip.serviceId(), value[1], value[3], shape.lengthMetres()));
+        }
+
+        ScheduleIndex index = new ScheduleIndex(byGroup, calendar);
+        log.info("Schedule: read {} stop_times rows in {}ms -> {} trips across {} route:direction groups"
+                        + " ({} skipped)",
+                rows, (System.nanoTime() - start) / 1_000_000,
+                index.tripCount(), index.groupCount(), skipped);
+        return index;
     }
 
     /** Fallback when the feed does not supply usable distances: haversine along the polyline. */

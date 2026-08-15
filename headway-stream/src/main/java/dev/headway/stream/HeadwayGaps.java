@@ -40,11 +40,44 @@ final class HeadwayGaps {
             Double maxGapMetres,
             Double meanGapMetres,
             List<String> orderedVehicles,
-            List<Double> orderedDistancesMetres) {
+            List<Double> orderedDistancesMetres,
+            List<String> layoverVehicles) {
 
         static Result empty() {
-            return new Result(0, List.of(), null, null, null, null, List.of(), List.of());
+            return new Result(0, List.of(), null, null, null, null,
+                    List.of(), List.of(), List.of());
         }
+    }
+
+    /**
+     * A vehicle that moved less than this within the window counts as stationary.
+     *
+     * <p>Not zero: GPS jitter alone moves a parked bus by a few metres, and the projection turns
+     * some of that sideways scatter into apparent movement along the route.
+     */
+    static final double STATIONARY_THRESHOLD_METRES = 25.0;
+
+    /** How close to either end of the route counts as being at a terminal. */
+    static final double TERMINAL_ZONE_METRES = 250.0;
+
+    /**
+     * Is this vehicle parked at a terminal rather than running the route?
+     *
+     * <p>Both conditions are required, and that is the whole point. Stationary <em>anywhere</em>
+     * would exclude buses stuck at a red light or dwelling at a busy stop, which are exactly the
+     * conditions that cause bunching and must stay in. Near a terminal but <em>moving</em> is a bus
+     * legitimately starting or finishing its run. Only stationary <em>and</em> at an endpoint is
+     * layover.
+     *
+     * @param movementMetres how far it travelled within the window
+     * @param distanceMetres where it currently is along the route
+     * @param routeLengthMetres total length of the route's shape
+     */
+    static boolean isLayover(double movementMetres, double distanceMetres, double routeLengthMetres) {
+        boolean stationary = movementMetres < STATIONARY_THRESHOLD_METRES;
+        boolean atEnd = distanceMetres <= TERMINAL_ZONE_METRES
+                || distanceMetres >= routeLengthMetres - TERMINAL_ZONE_METRES;
+        return stationary && atEnd;
     }
 
     /**
@@ -70,8 +103,34 @@ final class HeadwayGaps {
      * @return statistics plus the ordered vehicles, so an alert can name which two buses are close
      */
     static Result compute(List<Sighting> sightings) {
+        return compute(sightings, Double.NaN);
+    }
+
+    /**
+     * As {@link #compute(List)}, but excluding vehicles parked at a terminal.
+     *
+     * <p>Each vehicle's movement within the window is the spread of its own sightings, which is
+     * why deduplication happens <em>after</em> measuring it rather than before: collapsing to the
+     * newest reading first would throw away the only evidence of whether the bus moved.
+     *
+     * @param routeLengthMetres length of the route's shape, or {@code NaN} to skip the filter
+     */
+    static Result compute(List<Sighting> sightings, double routeLengthMetres) {
         if (sightings == null || sightings.isEmpty()) {
             return Result.empty();
+        }
+
+        // 0. how far each vehicle moved across the window, before anything is discarded
+        Map<String, double[]> extent = new HashMap<>(); // vehicleId -> {min, max}
+        for (Sighting sighting : sightings) {
+            double[] range = extent.get(sighting.vehicleId());
+            if (range == null) {
+                extent.put(sighting.vehicleId(),
+                        new double[] {sighting.distanceMetres(), sighting.distanceMetres()});
+            } else {
+                range[0] = Math.min(range[0], sighting.distanceMetres());
+                range[1] = Math.max(range[1], sighting.distanceMetres());
+            }
         }
 
         // 1. newest reading per vehicle
@@ -80,6 +139,19 @@ final class HeadwayGaps {
             Sighting previous = newest.get(sighting.vehicleId());
             if (previous == null || sighting.timestampMillis() > previous.timestampMillis()) {
                 newest.put(sighting.vehicleId(), sighting);
+            }
+        }
+
+        // 1b. drop vehicles sitting still at a terminal
+        List<String> onLayover = new ArrayList<>();
+        if (!Double.isNaN(routeLengthMetres) && routeLengthMetres > 0) {
+            for (Map.Entry<String, Sighting> entry : Map.copyOf(newest).entrySet()) {
+                double[] range = extent.get(entry.getKey());
+                double movement = range[1] - range[0];
+                if (isLayover(movement, entry.getValue().distanceMetres(), routeLengthMetres)) {
+                    onLayover.add(entry.getKey());
+                    newest.remove(entry.getKey());
+                }
             }
         }
 
@@ -102,6 +174,7 @@ final class HeadwayGaps {
             gaps.add(distances.get(i) - distances.get(i - 1));
         }
 
+        onLayover.sort(String::compareTo);
         return new Result(
                 ordered.size(),
                 List.copyOf(gaps),
@@ -111,7 +184,8 @@ final class HeadwayGaps {
                 gaps.isEmpty() ? null
                         : gaps.stream().mapToDouble(Double::doubleValue).average().orElseThrow(),
                 List.copyOf(vehicleIds),
-                List.copyOf(distances));
+                List.copyOf(distances),
+                List.copyOf(onLayover));
     }
 
     /** Middle value, or the mean of the middle two for an even count. Null for no values. */

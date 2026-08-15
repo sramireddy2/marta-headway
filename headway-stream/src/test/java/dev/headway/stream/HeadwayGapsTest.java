@@ -240,6 +240,120 @@ class HeadwayGapsTest {
         }
     }
 
+    /**
+     * The layover filter, driven by what step 7 actually produced against live data: vehicles 3503
+     * and 3694 sat at 0.0 m and 38.1 m on route 89 for over 90 seconds and were reported as a
+     * 38 m gap every window. Correct arithmetic, useless alert.
+     */
+    @Nested
+    @DisplayName("excluding buses parked at a terminal")
+    class LayoverFiltering {
+
+        private static final double ROUTE_LENGTH = 21_600;
+
+        @Test
+        @DisplayName("the real route 89 case: two parked buses stop producing a phantom gap")
+        void theRealCase() {
+            List<Sighting> window = List.of(
+                    // Two buses at the terminal, not moving across three sightings each.
+                    at("3503", 0.0, T0), at("3503", 0.0, T0 + 15_000), at("3503", 0.0, T0 + 30_000),
+                    at("3694", 38.1, T0), at("3694", 38.1, T0 + 15_000), at("3694", 38.1, T0 + 30_000),
+                    // Two genuinely running.
+                    at("3519", 10_100, T0), at("3519", 10_400, T0 + 30_000),
+                    at("3507", 13_000, T0), at("3507", 13_300, T0 + 30_000));
+
+            HeadwayGaps.Result r = HeadwayGaps.compute(window, ROUTE_LENGTH);
+
+            assertThat(r.layoverVehicles()).containsExactly("3503", "3694");
+            assertThat(r.vehicleCount()).isEqualTo(2);
+            assertThat(r.gapsMetres()).containsExactly(2900.0);
+            assertThat(r.minGapMetres())
+                    .as("the 38 m phantom gap is gone")
+                    .isEqualTo(2900.0);
+        }
+
+        /**
+         * Both conditions are required. A bus stopped at a red light or dwelling at a busy stop is
+         * stationary too — and those are exactly the conditions that cause bunching, so excluding
+         * them would blind the detector to the thing it exists to find.
+         */
+        @Test
+        @DisplayName("a stationary bus mid-route is kept, because that is what bunching looks like")
+        void stationaryMidRouteIsKept() {
+            List<Sighting> window = List.of(
+                    at("stuck", 9000, T0), at("stuck", 9005, T0 + 30_000),
+                    at("behind", 9100, T0), at("behind", 9200, T0 + 30_000));
+
+            HeadwayGaps.Result r = HeadwayGaps.compute(window, ROUTE_LENGTH);
+
+            assertThat(r.layoverVehicles()).isEmpty();
+            assertThat(r.vehicleCount()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("a moving bus near a terminal is kept — it is starting its run")
+        void movingNearTerminalIsKept() {
+            List<Sighting> window = List.of(
+                    at("departing", 20, T0), at("departing", 300, T0 + 30_000),
+                    at("ahead", 2000, T0), at("ahead", 2300, T0 + 30_000));
+
+            HeadwayGaps.Result r = HeadwayGaps.compute(window, ROUTE_LENGTH);
+
+            assertThat(r.layoverVehicles()).isEmpty();
+            assertThat(r.vehicleCount()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("the far terminal counts too, not just the start")
+        void endOfRouteAlsoCounts() {
+            List<Sighting> window = List.of(
+                    at("arrived", ROUTE_LENGTH - 10, T0), at("arrived", ROUTE_LENGTH - 10, T0 + 30_000),
+                    at("running", 5000, T0), at("running", 5300, T0 + 30_000));
+
+            HeadwayGaps.Result r = HeadwayGaps.compute(window, ROUTE_LENGTH);
+
+            assertThat(r.layoverVehicles()).containsExactly("arrived");
+        }
+
+        @Test
+        @DisplayName("GPS jitter on a parked bus does not make it look like it moved")
+        void jitterIsNotMovement() {
+            List<Sighting> window = List.of(
+                    at("parked", 10, T0), at("parked", 22, T0 + 15_000), at("parked", 4, T0 + 30_000),
+                    at("running", 5000, T0), at("running", 5300, T0 + 30_000));
+
+            HeadwayGaps.Result r = HeadwayGaps.compute(window, ROUTE_LENGTH);
+
+            assertThat(r.layoverVehicles()).containsExactly("parked");
+        }
+
+        @Test
+        @DisplayName("without a route length the filter is skipped entirely")
+        void noRouteLengthSkipsTheFilter() {
+            List<Sighting> window = List.of(at("3503", 0.0, T0), at("3694", 38.1, T0));
+
+            HeadwayGaps.Result r = HeadwayGaps.compute(window);
+
+            assertThat(r.layoverVehicles()).isEmpty();
+            assertThat(r.gapsMetres()).containsExactly(38.1);
+        }
+
+        /** Movement is measured before deduplication, or there would be nothing to measure. */
+        @Test
+        @DisplayName("movement is judged across all sightings, not just the newest")
+        void movementUsesTheWholeWindow() {
+            List<Sighting> window = List.of(
+                    at("mover", 5, T0), at("mover", 400, T0 + 30_000),
+                    at("other", 3000, T0), at("other", 3300, T0 + 30_000));
+
+            HeadwayGaps.Result r = HeadwayGaps.compute(window, ROUTE_LENGTH);
+
+            assertThat(r.layoverVehicles())
+                    .as("it moved 395 m, so it is running despite ending near the start")
+                    .isEmpty();
+        }
+    }
+
     @Nested
     @DisplayName("edge cases")
     class EdgeCases {

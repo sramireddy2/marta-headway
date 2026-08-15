@@ -45,7 +45,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 | 5 | Static GTFS (routes, trips, shapes) + Guava LoadingCache | ✅ |
 | 6 | Project GPS onto route shape → "distance along route" | ✅ |
 | 7 | Spark Structured Streaming headway computation | ✅ |
-| 8 | Bunching / gapping detection + alert topic | ☐ |
+| 8 | Bunching / gapping detection + alert topic | ✅ |
 | 9 | Spring Boot REST + WebSocket API | ☐ |
 | 10 | Leaflet live map front-end | ☐ |
 | 11 | Concurrency hardening (StampedLock / Striped locks) + benchmarks | ☐ |
@@ -663,7 +663,114 @@ built against 2.13.17 throws `NoSuchMethodError: MurmurHash3$.caseClassHash` the
 `SparkSession` is created. Scala's standard library is not binary compatible across patch releases
 in the way the version number suggests.
 
-### A finding that step 8 has to handle
+## Bunching detection
+
+A 400 m gap between two buses means nothing on its own. On a route running every 4 minutes it is
+severe bunching; on one running every 45 it is unremarkable. **Only the ratio of observed to
+scheduled headway is interpretable**, so the schedule has to be reconstructed first.
+
+### Reconstructing the timetable
+
+MARTA publishes no `frequencies.txt`, so scheduled headway comes from `stop_times.txt` — 2,415,219
+rows, 126 MB, the largest file in the feed. All that is needed from it is, per trip, the departure
+from the first stop and the arrival at the last: two rows out of the forty-odd each trip
+contributes. It is streamed and reduced on the fly, tracking the lowest and highest `stop_sequence`
+per trip, so peak memory is one small array per trip rather than 2.4 million parsed rows.
+
+```
+Calendar: 19 weekly services, 4 dates with additions, 4 with removals
+Schedule: read 2415218 stop_times rows in 4893ms -> 52401 trips across 169 route:direction groups (0 skipped)
+Loaded static GTFS in 6540ms
+```
+
+Then for a route, direction and moment: take trips whose service runs today, keep those departing
+within ±45 minutes, and take the **median** gap between consecutive departures. Median because a
+mid-morning break between peaks would otherwise drag the "typical" headway well above what riders
+actually experience.
+
+Average speed comes from the timetable too — shape length over scheduled running time — which
+already includes every stop and dwell. That converts a scheduled headway in minutes into an
+expected **spacing in metres**, directly comparable to what the projection produces.
+
+### Two GTFS traps this had to handle
+
+**Times past midnight.** 88,862 rows have an hour of 24 or more, up to 26 — after-midnight services
+belonging to the *previous* operating day. `LocalTime.parse("25:30:00")` throws, so times are
+parsed by hand into seconds since the start of the service day. MARTA also writes `" 6:20:00"`
+with a leading space and no zero padding.
+
+**Service calendars.** The feed holds every kind of day at once: weekday, Saturday, Sunday and
+holiday trips all sit in the same `trips.txt`, separated only by `service_id`. `calendar.txt` gives
+the weekly pattern (service 5 = Mon–Fri, 3 = Saturday, 4 = Sunday) and `calendar_dates.txt`
+overrides it — on 2026-07-04 service 29 is added and service 3 removed. Skip the filtering and a
+Friday rush hour averages with a Sunday morning, halving the apparent headway and making a
+perfectly spaced fleet look bunched.
+
+### Classification
+
+| Ratio | Status |
+|---|---|
+| ≤ 0.25 | `SEVERE_BUNCHING` |
+| ≤ 0.50 | `BUNCHING` |
+| 0.50 – 1.50 | `ON_SCHEDULE` |
+| ≥ 1.50 | `GAPPING` |
+| ≥ 2.50 | `SEVERE_GAPPING` |
+| — | `LAYOVER` (parked at a terminal) |
+
+Only the four abnormal statuses reach `headway-alerts`. `ON_SCHEDULE` and `LAYOVER` are the large
+majority, and an alert feed that includes them is one nobody reads.
+
+### The layover filter
+
+Step 7 found route 89 reporting a 38.1 m gap in every window — two buses parked at a terminal, not
+bunched. A vehicle is now excluded when it is **stationary *and* near an endpoint**. Both
+conditions are required, and that is the point: stationary anywhere would exclude buses stuck at a
+red light or dwelling at a busy stop, which are exactly the conditions that *cause* bunching.
+Movement is measured across all of a vehicle's sightings before deduplication, since collapsing to
+the newest reading first would throw away the only evidence it moved.
+
+### Live results
+
+```
+=== batch 2: 50 route-direction groups with 2+ buses ===
+    11 alerts
+|headwayGroup|routeLongName                 |status         |gap_m |expected_m|ratio|sched_min|buses       |
+|140:1       |North Point Parkway           |SEVERE_BUNCHING|17.0  |8910.0    |0.00 |20.0     |[3687, 3681]|
+|10:1        |AUC / Hollywood Road          |SEVERE_BUNCHING|2713.0|12503.0   |0.22 |30.0     |[4663, 4671]|
+|51:1        |Joseph E. Boone / Ralph McGill|SEVERE_BUNCHING|1973.0|8579.0    |0.23 |20.0     |[4669, 4651]|
+|71:0        |Cascade Road                  |BUNCHING       |3295.0|10290.0   |0.32 |20.0     |[4658, 4636]|
+```
+
+Two buses **17 metres apart** on a route scheduled every 20 minutes. And route 89 now reports a real
+4,262 m gap instead of the 38.1 m phantom — the layover filter working.
+
+11 alerts from 50 groups: the filter discriminates rather than firing on everything. A full alert
+names the pair, so it is actionable rather than merely true:
+
+```json
+{"headwayGroup":"71:0","routeLongName":"Cascade Road","status":"BUNCHING",
+ "scheduledHeadwaySeconds":1200,"expectedSpacingMetres":10289.9,"averageSpeedMps":8.57,
+ "minGapMetres":3442.0,"observedHeadwaySeconds":401.4,"headwayRatio":0.334,
+ "orderedVehicles":["4658","4636","4643"],"worstPairVehicles":["4658","4636"],
+ "orderedDistancesMetres":[4554.4,7996.4,11798.7]}
+```
+
+*Buses 4658 and 4636 on Cascade Road are 6.7 minutes apart. They should be 20.*
+
+### A bug the tests caught
+
+`ScheduleIndex` treated an **empty** set of active services as "don't filter" rather than "nothing
+runs today". On a Saturday that folded every weekday trip back in, roughly halving the apparent
+scheduled headway and reporting a correctly spaced fleet as bunched. Only a genuinely absent
+calendar disables filtering now.
+
+### An honest limitation
+
+Sliding windows mean the same event appears in two or three overlapping windows, so alerts repeat.
+Records are keyed by `headwayGroup`, so a compacted topic or a consumer keeping the latest per key
+collapses them — but as it stands a dispatcher would see the same bunching two or three times.
+
+### The finding that shaped step 8
 
 Route 89 direction 0 reported a 38.1 m gap in every window. Pulling the full record:
 
@@ -673,12 +780,8 @@ Route 89 direction 0 reported a 38.1 m gap in every window. Pulling the full rec
 ```
 
 Vehicles 3503 and 3694 sat at 0.0 m and 38.1 m, unchanged across three windows spanning 90
-seconds. They are **parked at the terminal**, not bunched — and the exact `0.0` is step 6's
-clamping, meaning 3503 is at or before the route start.
-
-Two buses on layover at a depot are not an operational problem, and a dispatcher alerted about
-them would stop reading the alerts. **Step 8 must exclude stationary vehicles at route endpoints**,
-or every terminal becomes a permanent false alarm.
+seconds. They were **parked at the terminal**, not bunched — and the exact `0.0` is step 6's
+clamping, meaning 3503 was at or before the route start. Fixed by the layover filter above.
 
 ## Troubleshooting
 

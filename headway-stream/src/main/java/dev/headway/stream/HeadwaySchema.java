@@ -53,7 +53,16 @@ final class HeadwaySchema {
             .add("maxGapMetres", DataTypes.DoubleType, true)
             .add("meanGapMetres", DataTypes.DoubleType, true)
             .add("orderedVehicles", DataTypes.createArrayType(DataTypes.StringType), false)
-            .add("orderedDistancesMetres", DataTypes.createArrayType(DataTypes.DoubleType), false);
+            .add("orderedDistancesMetres", DataTypes.createArrayType(DataTypes.DoubleType), false)
+            .add("layoverVehicles", DataTypes.createArrayType(DataTypes.StringType), false)
+            // --- the schedule comparison, null when the timetable has nothing to say ---
+            .add("scheduledHeadwaySeconds", DataTypes.IntegerType, true)
+            .add("expectedSpacingMetres", DataTypes.DoubleType, true)
+            .add("averageSpeedMps", DataTypes.DoubleType, true)
+            .add("observedHeadwaySeconds", DataTypes.DoubleType, true)
+            .add("headwayRatio", DataTypes.DoubleType, true)
+            .add("status", DataTypes.StringType, true)
+            .add("worstPairVehicles", DataTypes.createArrayType(DataTypes.StringType), true);
 
     private HeadwaySchema() {}
 }

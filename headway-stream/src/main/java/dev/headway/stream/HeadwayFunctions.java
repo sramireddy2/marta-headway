@@ -1,17 +1,21 @@
 package dev.headway.stream;
 
 import dev.headway.gtfs.GtfsSnapshot;
+import dev.headway.gtfs.HeadwayStatus;
+import dev.headway.gtfs.ScheduleIndex;
 import dev.headway.gtfs.ShapeProjection;
 import dev.headway.gtfs.ShapeProjector;
 import dev.headway.gtfs.TripContext;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
-import org.apache.spark.sql.api.java.UDF1;
 import org.apache.spark.sql.api.java.UDF3;
+import org.apache.spark.sql.api.java.UDF4;
 import org.apache.spark.sql.expressions.UserDefinedFunction;
 import org.apache.spark.sql.functions;
 import scala.collection.JavaConverters;
@@ -35,6 +39,15 @@ final class HeadwayFunctions {
 
     /** Beyond this the fix is not on the route we think it is — usually a deadheading bus. */
     static final double MAX_CROSS_TRACK_METRES = 150.0;
+
+    /**
+     * GTFS schedule times are in the agency's local time, not UTC.
+     *
+     * <p>Looking up an 18:30 Atlanta schedule with the UTC hour would read the 22:30 timetable —
+     * comparing a rush-hour service against a late-evening one, and reporting bunching on a route
+     * that is running exactly as planned. Silent, seasonal, and four hours wrong.
+     */
+    static final ZoneId AGENCY_ZONE = ZoneId.of("America/New_York");
 
     private HeadwayFunctions() {}
 
@@ -95,8 +108,17 @@ final class HeadwayFunctions {
      * <p>Returns the ordered vehicles and distances alongside the statistics so an alert can name
      * which two buses are too close, not merely that some pair is.
      */
-    static UserDefinedFunction gapsUdf() {
-        UDF1<Object, Row> fn = sightings -> {
+    /**
+     * Computes the gaps and classifies them against the timetable.
+     *
+     * <p>Takes the route length so terminal layovers can be excluded, and the window's end time so
+     * the correct scheduled headway is used — a route running every 5 minutes at 08:00 may run
+     * every 40 at 22:00, and comparing against the wrong one inverts the answer.
+     */
+    static UserDefinedFunction gapsUdf(Broadcast<GtfsSnapshot> gtfs) {
+        UDF4<Object, String, Double, java.sql.Timestamp, Row> fn =
+                (sightings, headwayGroup, routeLengthMetres, windowEnd) -> {
+
             List<HeadwayGaps.Sighting> parsed = new ArrayList<>();
             for (Row row : toRowList(sightings)) {
                 parsed.add(new HeadwayGaps.Sighting(
@@ -105,7 +127,52 @@ final class HeadwayFunctions {
                         timestampOf(row)));
             }
 
-            HeadwayGaps.Result result = HeadwayGaps.compute(parsed);
+            double length = routeLengthMetres == null ? Double.NaN : routeLengthMetres;
+            HeadwayGaps.Result result = HeadwayGaps.compute(parsed, length);
+
+            // Everything below is the schedule comparison; all of it may be absent.
+            Integer scheduledSeconds = null;
+            Double expectedSpacing = null;
+            Double speed = null;
+            Double observedSeconds = null;
+            Double ratio = null;
+            String status = null;
+            String[] worstPair = null;
+
+            if (!result.gapsMetres().isEmpty() && windowEnd != null) {
+                ZonedDateTime at = windowEnd.toInstant().atZone(AGENCY_ZONE);
+                Optional<ScheduleIndex.Scheduled> scheduled = gtfs.value().schedule()
+                        .scheduledFor(headwayGroup, at.toLocalDate(),
+                                at.toLocalTime().toSecondOfDay());
+
+                if (scheduled.isPresent()) {
+                    ScheduleIndex.Scheduled s = scheduled.get();
+                    scheduledSeconds = s.headwaySeconds();
+                    speed = s.averageSpeedMps();
+                    expectedSpacing = s.expectedSpacingMetres();
+
+                    // The tightest gap is what a dispatcher acts on: one bunched pair is a problem
+                    // even when every other pair on the route is perfectly spaced.
+                    double worstGap = result.minGapMetres();
+                    observedSeconds = worstGap / s.averageSpeedMps();
+                    ratio = expectedSpacing > 0 ? worstGap / expectedSpacing : null;
+
+                    if (ratio != null) {
+                        status = HeadwayStatus.fromRatio(ratio).name();
+                        int index = result.gapsMetres().indexOf(worstGap);
+                        if (index >= 0 && index + 1 < result.orderedVehicles().size()) {
+                            worstPair = new String[] {
+                                    result.orderedVehicles().get(index),
+                                    result.orderedVehicles().get(index + 1)};
+                        }
+                    }
+                }
+            }
+
+            if (status == null && !result.layoverVehicles().isEmpty()
+                    && result.vehicleCount() < 2) {
+                status = HeadwayStatus.LAYOVER.name();
+            }
 
             return RowFactory.create(
                     result.vehicleCount(),
@@ -115,7 +182,10 @@ final class HeadwayFunctions {
                     result.maxGapMetres(),
                     result.meanGapMetres(),
                     result.orderedVehicles().toArray(new String[0]),
-                    result.orderedDistancesMetres().toArray(new Double[0]));
+                    result.orderedDistancesMetres().toArray(new Double[0]),
+                    result.layoverVehicles().toArray(new String[0]),
+                    scheduledSeconds, expectedSpacing, speed,
+                    observedSeconds, ratio, status, worstPair);
         };
         return functions.udf(fn, HeadwaySchema.HEADWAYS);
     }

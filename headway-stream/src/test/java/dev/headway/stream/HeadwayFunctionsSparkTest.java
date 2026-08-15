@@ -74,7 +74,7 @@ class HeadwayFunctionsSparkTest {
                 scala.reflect.ClassTag$.MODULE$.apply(GtfsSnapshot.class));
 
         projectUdf = HeadwayFunctions.projectUdf(gtfs);
-        gapsUdf = HeadwayFunctions.gapsUdf();
+        gapsUdf = HeadwayFunctions.gapsUdf(gtfs);
     }
 
     @AfterAll
@@ -192,7 +192,10 @@ class HeadwayFunctionsSparkTest {
                 .groupBy(col("headwayGroup"))
                 .agg(collect_list(struct(col("vehicleId"), col("distanceMetres"), col("ts")))
                         .as("sightings"))
-                .withColumn("h", gapsUdf.apply(col("sightings")));
+                .withColumn("h", gapsUdf.apply(col("sightings"), col("headwayGroup"),
+                        org.apache.spark.sql.functions.lit(Double.NaN),
+                        org.apache.spark.sql.functions.lit(null)
+                                .cast(DataTypes.TimestampType)));
 
         List<Row> out = result.collectAsList();
         assertThat(out).hasSize(1);
@@ -227,7 +230,10 @@ class HeadwayFunctionsSparkTest {
                 .groupBy(col("headwayGroup"))
                 .agg(collect_list(struct(col("vehicleId"), col("distanceMetres"), col("ts")))
                         .as("sightings"))
-                .withColumn("h", gapsUdf.apply(col("sightings")));
+                .withColumn("h", gapsUdf.apply(col("sightings"), col("headwayGroup"),
+                        org.apache.spark.sql.functions.lit(Double.NaN),
+                        org.apache.spark.sql.functions.lit(null)
+                                .cast(DataTypes.TimestampType)));
 
         Row h = result.collectAsList().getFirst().getAs("h");
 

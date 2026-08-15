@@ -24,6 +24,8 @@ class GtfsStaticRepositoryTest {
     private static GtfsSnapshot snapshotNumber(int n) {
         return new GtfsSnapshot(
                 ImmutableMap.of(), ImmutableMap.of(), ImmutableMap.of(), ImmutableMap.of(),
+                ServiceCalendar.permissive(),
+                new ScheduleIndex(java.util.Map.of(), ServiceCalendar.permissive()),
                 Instant.now(), Instant.ofEpochSecond(n));
     }
 
