@@ -43,7 +43,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 | 3 | Kafka in Docker + producer keyed by route | ✅ |
 | 4 | Bounded sharded queue, backpressure, virtual threads, Micrometer | ✅ |
 | 5 | Static GTFS (routes, trips, shapes) + Guava LoadingCache | ✅ |
-| 6 | Project GPS onto route shape → "distance along route" | ☐ |
+| 6 | Project GPS onto route shape → "distance along route" | ✅ |
 | 7 | Spark Structured Streaming headway computation | ☐ |
 | 8 | Bunching / gapping detection + alert topic | ☐ |
 | 9 | Spring Boot REST + WebSocket API | ☐ |
@@ -366,6 +366,98 @@ we need, so `stop_times.txt` is never decompressed at all.
 **Shapes as three `double[]`, not a `List<Point>`.** 359,676 points as objects means 359,676 heap
 allocations reached through pointers. Three parallel primitive arrays hold the same data in ~8.6 MB
 of contiguous memory, which is what step 6's per-vehicle nearest-segment scan will walk.
+
+## Projecting GPS onto the route
+
+Two buses at `(33.75, -84.39)` and `(33.77, -84.41)` are 2.7 km apart as the crow flies. That
+number is useless — buses follow streets, and the route between them might be 2.8 km or 9 km
+depending on how it winds. `ShapeProjector` snaps each GPS point onto the route's polyline and
+returns **how far along the route it is**, turning two coordinates into two positions on a line.
+On a line, the gap between two buses is a subtraction.
+
+```bash
+.\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests "-Dexec.mainClass=dev.headway.ingest.HeadwayPreviewMain"
+```
+
+### Why not planar geometry on degrees
+
+At Atlanta's latitude one degree of longitude is ~92.6 km while one degree of latitude is
+~111.3 km. Treating them as equal stretches every east-west distance by 20% and picks the wrong
+segment near diagonal corners. Each segment is instead converted into a local east-north plane in
+metres, centred on the query point:
+
+```
+x = (lon - queryLon) * 111195.08 * cos(queryLat)
+y = (lat - queryLat) * 111195.08
+```
+
+That is the equirectangular approximation — sub-metre accurate over the tens of km a route spans,
+and two multiplications instead of trigonometry per segment. Centring on the query point also puts
+it at the origin, which simplifies the point-to-segment maths.
+
+Distance along the route interpolates the feed's own `shape_dist_traveled` rather than summing
+computed segment lengths, so projection error never accumulates along the route.
+
+### Validated against 359,676 real shape points
+
+Projecting a shape's own vertices back onto that shape must return each vertex's own distance:
+
+```
+9093 vertices across 215 shapes in 498ms (18259 projections/sec)
+worst cross-track error   : 0.0000 m   <- the geometry itself
+worst along-route error   : 13458.3 m (shape 136624)
+vertices with >50 m along-route error: 19 of 9093 (0.21%), across 16 shapes
+  still wrong when given a previous-position hint: 4
+```
+
+**Cross-track error is exactly zero** — the geometry is right. The 13.4 km along-route error with
+*zero* cross-track is not a bug: shape 136624 passes through that identical coordinate twice. The
+question "where on the route is this?" genuinely has two answers.
+
+### The loop problem, and the fix
+
+A route that loops or doubles back along one street has two segments near-equally close to any
+point on the doubled section. GPS jitter of a few metres flips which one wins, and the bus appears
+to teleport kilometres between polls.
+
+`projectNear(shape, lat, lon, hintMetres, windowMetres)` searches only the stretch near the
+vehicle's *previous* position. A bus that was at 8,000 m fifteen seconds ago is still within a few
+hundred metres of that, so the far-away duplicate is excluded outright. It is also faster — a
+binary search over the sorted cumulative distances, then a scan of a fraction of the polyline.
+
+Measured effect: **19 ambiguous vertices → 4**. The residue is tight doublings-back where both
+candidates fall inside the plausible-movement window. Affected shapes are 16 of 215 (7%), and
+affected positions 0.21%.
+
+### Live GPS quality
+
+```
+164 vehicles projected in 11.3ms (69us per vehicle)
+cross-track: median 5.1 m | p90 15.6 m | p99 2832.5 m | max 5443.6 m
+8 of 164 vehicles are more than 100 m off route
+```
+
+Median 5 m and p90 16 m means real fixes land essentially on the shape. The handful of multi-km
+outliers are buses assigned to a trip they have not started — deadheading to the route's start.
+`ShapeProjection.isOnRoute(maxCrossTrackMetres)` exists for exactly this; step 7 should discard
+projections beyond roughly 150 m rather than compute headways from them.
+
+### Actual gaps, right now
+
+```
+group 121:1 — 4 buses on a 28.8 km shape
+   4625 at  6171.3 m
+   3670 at  9106.2 m   gap  2934.9 m
+   5117 at 24686.0 m   gap 15579.8 m
+   4605 at 28680.3 m   gap  3994.3 m
+
+tightest gaps anywhere in the system:
+    19.0 m apart on group 140:1
+    92.7 m apart on group 89:0
+```
+
+Two buses **19 metres apart** on route 140. That is bunching, live, detected end to end — and it is
+what step 7 turns into an alert.
 
 ### Caching: `refreshAfterWrite` vs `expireAfterWrite`
 
