@@ -26,7 +26,9 @@ package dev.headway.gtfs;
  * {@code shape_dist_traveled} of 10.8389, a ratio of 997.8 m per unit. Distances are converted to
  * <b>metres</b> at parse time so exactly one unit exists everywhere else in the codebase.
  */
-public final class RouteShape {
+public final class RouteShape implements java.io.Serializable {
+
+    private static final long serialVersionUID = 1L;
 
     private final String shapeId;
     private final double[] lat;

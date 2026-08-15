@@ -66,5 +66,43 @@ services:
       retries: 12
       start_period: 20s
 
+  # The Spark job, in a container rather than on the host.
+  #
+  # Not a preference - a requirement on Windows. Structured Streaming checkpointing goes through
+  # Hadoop's filesystem layer, which calls native winutils.exe/hadoop.dll that Windows does not
+  # have; a local run dies with "HADOOP_HOME and hadoop.home.dir are unset". Batch Spark works
+  # fine on Windows, which is why the smoke test passed and the streaming job did not.
+  #
+  # Started only on request, so `docker compose up -d` still just brings up Kafka:
+  #   docker compose --profile stream up spark
+  spark:
+    image: apache/spark:4.1.3-scala2.13-java21-ubuntu
+    container_name: headway-spark
+    profiles: ["stream"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      # kafka:29092, not localhost:9092. This container is on the compose network, so it uses the
+      # DOCKER listener declared above - the reason there are two listeners at all.
+      HEADWAY_KAFKA_BOOTSTRAP: kafka:29092
+      HEADWAY_KAFKA_TOPIC: vehicle-positions
+      HEADWAY_HEADWAY_TOPIC: route-headways
+      HEADWAY_STARTING_OFFSETS: latest
+      HEADWAY_GTFS_DIR: /data/gtfs
+      HEADWAY_CHECKPOINT_DIR: /data/spark-checkpoint
+    volumes:
+      - ./headway-stream/target:/app:ro
+      - ./data:/data
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[*]
+      - --class
+      - dev.headway.stream.HeadwayStreamMain
+      - --conf
+      - spark.driver.memory=2g
+      - /app/headway-stream-0.1.0-SNAPSHOT-submit.jar
+
 volumes:
   kafka-data:

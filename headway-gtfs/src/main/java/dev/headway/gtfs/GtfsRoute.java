@@ -21,7 +21,7 @@ public record GtfsRoute(
         String shortName,
         String longName,
         int routeType,
-        String colorHex) {
+        String colorHex) implements java.io.Serializable {
 
     public GtfsRoute {
         Objects.requireNonNull(routeId, "routeId");

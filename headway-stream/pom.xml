@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>dev.headway</groupId>
+    <artifactId>headway-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>headway-stream</artifactId>
+  <name>Headway :: Stream</name>
+  <description>Spark Structured Streaming job computing live headways from the Kafka topic.</description>
+
+  <dependencies>
+    <!--
+      `provided`: the apache/spark image already contains these, and bundling a second copy into
+      the jar is the classic way to get NoSuchMethodError from two Spark versions on one classpath.
+      Provided means "compile against it, do not ship it".
+    -->
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_2.13</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!--
+      NOT provided. The Kafka connector is an optional Spark component and is absent from the
+      base image, so it has to travel in our jar along with the Kafka client it needs.
+    -->
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql-kafka-0-10_2.13</artifactId>
+      <version>${spark.version}</version>
+      <exclusions>
+        <!--
+          The connector drags in the whole Hadoop client (28,000 classes, ~60 MB) and Spark's own
+          transitive Scala. The runtime image already ships both, so bundling a second copy only
+          bloats the jar and invites two versions of Hadoop on one classpath.
+        -->
+        <exclusion>
+          <groupId>org.apache.hadoop</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>org.scala-lang</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+
+    <!-- Supplied by the Spark image; compile against it, do not ship it. -->
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+      <version>2.13.16</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>dev.headway</groupId>
+      <artifactId>headway-gtfs</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!--
+        Builds one self-contained jar for spark-submit. A Spark job runs on executors that know
+        nothing about your Maven repository, so every class the job touches must be inside the jar
+        it is submitted with.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <shadedArtifactAttached>true</shadedArtifactAttached>
+              <shadedClassifierName>submit</shadedClassifierName>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <!--
+                      Dependencies are signed; concatenating several signed jars leaves signature
+                      files that no longer match the contents, and the JVM refuses to load classes
+                      with "Invalid signature file digest". Dropping them is the standard fix.
+                    -->
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>module-info.class</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <!-- Spark discovers its data sources through this file; without merging, the
+                     "kafka" format would not be found at runtime. -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -10,7 +10,8 @@ package dev.headway.gtfs;
  * @param trip the specific scheduled run, carrying the <em>trustworthy</em> direction
  * @param shape the polyline the trip follows, which step 6 projects the GPS point onto
  */
-public record TripContext(GtfsRoute route, GtfsTrip trip, RouteShape shape) {
+public record TripContext(GtfsRoute route, GtfsTrip trip, RouteShape shape)
+        implements java.io.Serializable {
 
     /**
      * The key that groups buses which can meaningfully bunch with each other.

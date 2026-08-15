@@ -20,7 +20,9 @@ import java.util.Optional;
  *       directly, and is the only trustworthy source of travel direction.
  * </ul>
  */
-public final class GtfsSnapshot {
+public final class GtfsSnapshot implements java.io.Serializable {
+
+    private static final long serialVersionUID = 1L;
 
     private final ImmutableMap<String, GtfsRoute> routesByStaticId;
     private final ImmutableMap<String, GtfsRoute> routesByShortName;

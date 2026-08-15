@@ -20,7 +20,7 @@ public record GtfsTrip(
         String routeId,
         int directionId,
         String shapeId,
-        String headsign) {
+        String headsign) implements java.io.Serializable {
 
     public GtfsTrip {
         Objects.requireNonNull(tripId, "tripId");

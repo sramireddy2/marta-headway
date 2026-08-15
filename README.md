@@ -44,7 +44,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 | 4 | Bounded sharded queue, backpressure, virtual threads, Micrometer | ✅ |
 | 5 | Static GTFS (routes, trips, shapes) + Guava LoadingCache | ✅ |
 | 6 | Project GPS onto route shape → "distance along route" | ✅ |
-| 7 | Spark Structured Streaming headway computation | ☐ |
+| 7 | Spark Structured Streaming headway computation | ✅ |
 | 8 | Bunching / gapping detection + alert topic | ☐ |
 | 9 | Spring Boot REST + WebSocket API | ☐ |
 | 10 | Leaflet live map front-end | ☐ |
@@ -548,6 +548,116 @@ The interesting parts, and where to read them:
 The concurrency test in `VehicleStoreTest` is not decorative: the same workload run against a
 naive `get()`-then-`put()` implementation served a stale position on 5 of 40 runs.
 
+## The Spark streaming job
+
+```
+Kafka vehicle-positions
+     |  parse JSON against a declared schema
+     v
+project onto the route shape        (broadcast GTFS + step 6's projector)
+     |  drop anything >150 m off route
+     v
+watermark 2 min, window 60s / slide 30s, group by route:direction
+     |  newest reading per vehicle, order by distance, difference neighbours
+     v
+console  +  Kafka route-headways
+```
+
+Build the submit jar, then run it (Kafka must already be up):
+
+```bash
+.\mvnw.cmd -q -pl headway-stream -am package -DskipTests
+```
+
+```bash
+docker compose --profile stream up spark
+```
+
+### Why Spark runs in Docker and not on the host
+
+Not a preference — a requirement on Windows. Structured Streaming **checkpointing** goes through
+Hadoop's filesystem layer, which calls native `winutils.exe` / `hadoop.dll` that Windows does not
+ship:
+
+```
+java.io.FileNotFoundException: HADOOP_HOME and hadoop.home.dir are unset
+```
+
+Batch Spark works fine on Windows — a `spark.range(1,11).count()` smoke test passed on Java 21
+with no flags at all — which is exactly why this only appears once you add a checkpoint. The usual
+workaround is downloading unofficial `winutils` binaries; running the official `apache/spark` image
+is cleaner, reproducible, and the reason the broker advertises two listeners.
+
+The container reaches Kafka at **`kafka:29092`** (the `DOCKER` listener), while the ingest service
+on the host uses `localhost:9092`. That two-listener config from step 3 is what makes both work at
+once.
+
+### Watermarking
+
+A window covering 10:00:00–10:01:00 cannot be closed the moment the clock passes 10:01 — a
+vehicle's 10:00:58 reading may arrive at 10:01:04. But Spark cannot wait forever either, or state
+grows without bound. `withWatermark("ts", "2 minutes")` says: once an event stamped 10:03 arrives,
+consider every window ending before 10:01 closed and drop its state.
+
+Two minutes is chosen from measured behaviour, not taste: MARTA republishes every ~30 s, vehicle
+timestamps trail the feed timestamp by up to ~2 minutes, and step 5's audit found one bus 708 s
+stale. Too low and real data is silently dropped; too high and memory grows and results lag. It is
+a completeness-against-latency dial.
+
+**Sliding, not tumbling.** 60 s windows every 30 s means each instant is covered twice, so a
+bunching event straddling a boundary cannot be split and missed by both windows.
+
+### Details worth knowing
+
+| Decision | Reason |
+|---|---|
+| Declared JSON schema | Inferring a schema from a stream samples whatever arrives first, and can differ between restarts — which invalidates the checkpoint |
+| Broadcast the GTFS snapshot | 8.6 MB of shapes; a captured reference would serialise a copy into *every task*. Broadcast ships it once per executor |
+| One `foreachBatch`, not two `writeStream`s | Two queries read the source topic twice; and `orderBy` needs `Complete` mode, which retains every window forever and defeats the watermark. A batch DataFrame sorts freely |
+| `batch.persist()` inside `foreachBatch` | The batch is consumed twice (show + Kafka write); without it Spark reruns the whole aggregation, projection UDF included |
+| `spark.sql.shuffle.partitions=8` | The default 200 means 200 near-empty tasks per batch for ~65 groups — the most common local-Spark slowdown |
+| Dedupe to newest-per-vehicle | A 60 s window at 15 s polling holds ~4 sightings of the same bus; without deduping you measure the gap between a bus and itself and report constant bunching |
+| `provided` Spark, shaded Kafka connector | The image supplies Spark; the Kafka connector is not in it. Excluding Hadoop and Scala from the shade took the jar from 72 MB to 18.8 MB |
+
+### It works
+
+```
+=== batch 5: 134 route-direction groups with 2+ buses ===
+|windowEnd          |headwayGroup|routeLongName        |vehicleCount|minGapMetres|maxGapMetres|
+|2026-08-15 02:30:30|95:1        |Metropolitan Parkway |2           |25.6        |25.6        |
+|2026-08-15 02:30:00|89:0        |Old National Highway |4           |38.1        |10095.3     |
+|2026-08-15 02:30:30|1:1         |Joseph E. Lowery Blvd|3           |1804.6      |4585.8      |
+```
+
+269 records landed on `route-headways`, each carrying the ordered vehicles and distances so an
+alert can name *which* two buses are too close:
+
+```json
+{"headwayGroup":"83:1","routeLongName":"Campbellton Road","vehicleCount":2,
+ "minGapMetres":4216.7,"orderedVehicles":["3541","3531"],
+ "orderedDistancesMetres":[79.5,4296.2]}
+```
+
+Only batch 0 fell behind the 30 s trigger (36 s — JIT warmup plus broadcasting the shapes);
+batches 1–5 kept up.
+
+### A finding that step 8 has to handle
+
+Route 89 direction 0 reported a 38.1 m gap in every window. Pulling the full record:
+
+```
+89:0  vehicles=[3503, 3694, 3519, 3507]
+      distances: [0.0, 38.1, 10133.4, 13165.8]
+```
+
+Vehicles 3503 and 3694 sat at 0.0 m and 38.1 m, unchanged across three windows spanning 90
+seconds. They are **parked at the terminal**, not bunched — and the exact `0.0` is step 6's
+clamping, meaning 3503 is at or before the route start.
+
+Two buses on layover at a depot are not an operational problem, and a dispatcher alerted about
+them would stop reading the alerts. **Step 8 must exclude stationary vehicles at route endpoints**,
+or every terminal becomes a permanent false alarm.
+
 ## Troubleshooting
 
 **`Failed to clean project: Failed to delete ...headway-common-0.1.0-SNAPSHOT.jar`**
@@ -569,8 +679,9 @@ The broker is not up. `docker compose up -d`, then wait for `docker compose ps` 
 ```
 headway-parent          the root pom: dependency versions, Java level, module list
 ├── headway-common      domain model + the JSON contract (VehiclePosition, Json)
-├── headway-gtfs        the scheduled feed: routes, trips, shapes, cached and refreshed
-└── headway-ingest      polls GTFS-Realtime, decodes protobuf, publishes to Kafka
+├── headway-gtfs        the scheduled feed: routes, trips, shapes, projection geometry
+├── headway-ingest      polls GTFS-Realtime, decodes protobuf, publishes to Kafka
+└── headway-stream      Spark job: Kafka -> windowed headways -> Kafka
 ```
 
 `headway-gtfs` deliberately does **not** depend on `headway-common`: it knows about the scheduled
