@@ -337,6 +337,22 @@ The interesting parts, and where to read them:
 The concurrency test in `VehicleStoreTest` is not decorative: the same workload run against a
 naive `get()`-then-`put()` implementation served a stale position on 5 of 40 runs.
 
+## Troubleshooting
+
+**`Failed to clean project: Failed to delete ...headway-common-0.1.0-SNAPSHOT.jar`**
+A previous run's JVM is still alive and holding the jar. Stopping the terminal does not always stop
+the Java process it launched. Find and kill it:
+
+```bash
+Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -like "*headway*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
+
+**`The JAVA_HOME environment variable is not defined correctly`**
+Either `JAVA_HOME` is wrong, or the terminal predates the fix — see [Set JAVA_HOME](#set-java_home).
+
+**`Timed out talking to Kafka at localhost:9092`**
+The broker is not up. `docker compose up -d`, then wait for `docker compose ps` to say healthy.
+
 ## Module layout
 
 ```

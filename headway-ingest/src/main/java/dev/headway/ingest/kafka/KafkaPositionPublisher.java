@@ -59,6 +59,8 @@ public final class KafkaPositionPublisher implements Consumer<VehiclePosition>, 
 
     private final LongAdder sent = new LongAdder();
     private final LongAdder failed = new LongAdder();
+    private final java.util.concurrent.atomic.AtomicBoolean closed =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     // Set via withMetrics(). Called from the producer's I/O thread, so they must be cheap and
     // must not throw — a Micrometer counter increment is both.
@@ -200,17 +202,31 @@ public final class KafkaPositionPublisher implements Consumer<VehiclePosition>, 
     }
 
     /**
-     * Flushes anything still batched, then closes.
+     * Flushes anything still batched, then closes. Safe to call more than once.
      *
      * <p>Without the flush, records sitting in the {@code linger.ms} buffer when the JVM exits are
      * simply lost. {@code close()} does flush internally, but calling it explicitly makes the
      * intent obvious and lets us log the final tally.
+     *
+     * <p>The idempotence guard is not decoration. On Ctrl+C the shutdown hook closes this
+     * publisher, then {@code main} wakes from its latch and the try-with-resources closes it
+     * again — and {@code KafkaProducer.flush()} on a closed producer throws
+     * {@link IllegalStateException}. The result is a stack trace during an otherwise clean
+     * shutdown. Any {@code close()} that two code paths can reach needs this.
      */
     @Override
     public void close() {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         producer.flush();
         log.info("Kafka publisher closing: {} sent, {} failed", sentTotal(), failedTotal());
         producer.close(Duration.ofSeconds(10));
+    }
+
+    /** Visible for tests: has {@link #close()} already run? */
+    public boolean isClosed() {
+        return closed.get();
     }
 
     /** Reads config from the environment so the app runs unchanged inside a container later. */

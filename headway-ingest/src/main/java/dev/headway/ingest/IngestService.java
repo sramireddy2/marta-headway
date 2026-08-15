@@ -119,6 +119,8 @@ public final class IngestService implements AutoCloseable {
     private final ScheduledExecutorService scheduler;
     private final ExecutorService fetchExecutor;
     private final ExecutorService workerExecutor;
+    private final java.util.concurrent.atomic.AtomicBoolean closed =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     public IngestService(VehicleFeed feed, Config config, Consumer<VehiclePosition> publisher) {
         this(feed, config, publisher, new IngestMetrics());
@@ -238,6 +240,11 @@ public final class IngestService implements AutoCloseable {
      */
     @Override
     public void close() {
+        // Reachable from both the shutdown hook and ordinary control flow; see
+        // KafkaPositionPublisher.close() for why that matters.
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         log.info("Shutting down ingest. Queue holds {} items.", queue.depth());
 
         scheduler.shutdown();

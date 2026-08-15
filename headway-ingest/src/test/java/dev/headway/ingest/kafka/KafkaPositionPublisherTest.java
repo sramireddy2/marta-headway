@@ -150,6 +150,31 @@ class KafkaPositionPublisherTest {
         }
     }
 
+    /**
+     * The Ctrl+C path, exactly.
+     *
+     * <p>The shutdown hook closes the publisher, then {@code main} wakes from its latch and
+     * try-with-resources closes it a second time. Without a guard the second call reaches
+     * {@code producer.flush()} on a closed producer, which throws — printing a stack trace in the
+     * middle of an otherwise clean shutdown.
+     */
+    @Test
+    @DisplayName("close() twice is safe, because the shutdown hook and main both call it")
+    void closeIsIdempotent() {
+        MockProducer<String, VehiclePosition> mock = mockProducer();
+        KafkaPositionPublisher publisher = new KafkaPositionPublisher(mock, TOPIC);
+        publisher.accept(ping("bus-1", "15"));
+
+        publisher.close();
+        assertThat(publisher.isClosed()).isTrue();
+
+        // Must not throw.
+        publisher.close();
+        publisher.close();
+
+        assertThat(mock.history()).hasSize(1);
+    }
+
     @Test
     @DisplayName("closing flushes so nothing is left in the linger buffer")
     void closeFlushes() {
