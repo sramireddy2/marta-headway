@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>dev.headway</groupId>
+    <artifactId>headway-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>headway-api</artifactId>
+  <name>Headway :: API</name>
+  <description>Spring Boot REST + WebSocket front door over the Kafka results.</description>
+
+  <properties>
+    <!-- The one module where `spring-boot:run` means something. See the parent pom. -->
+    <spring-boot.run.skip>false</spring-boot.run.skip>
+  </properties>
+
+  <!--
+    Spring Boot's BOM, imported here rather than in the parent so that it constrains this module
+    and nothing else. See the note in the parent pom for what happened when it was up there.
+
+    ORDER MATTERS INSIDE THIS BLOCK. Maven takes the first matching entry in declaration order, and
+    an imported BOM is expanded where it is declared. Boot's BOM pins Jackson and kafka-clients to
+    the versions Boot was tested against, both older than what this project already uses elsewhere.
+    Re-declaring them above the import keeps one Jackson and one Kafka client across the whole
+    build; put the import first and this module quietly parses the topic with a different Jackson
+    than the module that wrote it.
+  -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.kafka</groupId>
+        <artifactId>kafka-clients</artifactId>
+        <version>${kafka.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring.boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- VehiclePosition and the shared Jackson configuration. -->
+    <dependency>
+      <groupId>dev.headway</groupId>
+      <artifactId>headway-common</artifactId>
+    </dependency>
+    <!--
+      Only for HeadwayStatus. The alert thresholds must have exactly one definition: if the API
+      re-declared "under half is bunching" it could drift from what the stream job wrote, and the
+      dashboard would disagree with the alert topic about the same record.
+    -->
+    <dependency>
+      <groupId>dev.headway</groupId>
+      <artifactId>headway-gtfs</artifactId>
+    </dependency>
+
+    <!--
+      A plain KafkaConsumer, not spring-kafka. Two reasons. spring-kafka pins its own kafka-clients
+      version and this project runs 4.x against a KRaft broker, so that is a fight not worth having.
+      And the consumer's threading rules - one thread per consumer, wakeup() as the only cross-thread
+      call - are the interesting part of this module, which an annotation would hide.
+    -->
+    <dependency>
+      <groupId>org.apache.kafka</groupId>
+      <artifactId>kafka-clients</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-websocket</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.awaitility</groupId>
+      <artifactId>awaitility</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Produces a self-contained runnable jar and enables `mvn spring-boot:run`. -->
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>repackage</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -1,0 +1,44 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: headway-api
+  jackson:
+    serialization:
+      # Boot already writes dates as ISO-8601. Durations are a separate switch and default to a
+      # float number of seconds, which would disagree with how the WebSocket frames render them.
+      write-durations-as-timestamps: false
+    default-property-inclusion: non_null
+  task:
+    scheduling:
+      pool:
+        # Two @Scheduled methods: the broadcast tick and the housekeeping sweep. With the default
+        # pool of one, a slow sweep delays every frame.
+        size: 2
+
+headway:
+  # From the host. Inside Compose this is kafka:29092 - the two-listener setup from step 3.
+  bootstrap-servers: ${HEADWAY_KAFKA_BOOTSTRAP:localhost:9092}
+  headway-topic: route-headways
+  vehicle-topic: vehicle-positions
+  # 'earliest' fills the dashboard instantly from retained records but replays the whole topic.
+  starting-offsets: ${HEADWAY_STARTING_OFFSETS:latest}
+  poll-timeout: 1s
+  route-ttl: 10m
+  vehicle-ttl: 5m
+  alert-linger: 3m
+  alert-history: 200
+  sweep-interval-millis: 15000
+  broadcast-interval-millis: 1000
+  socket-buffer-bytes: 524288
+  socket-send-timeout-millis: 10000
+
+logging:
+  level:
+    root: INFO
+    dev.headway: INFO
+    # The consumer logs a warning on every failed connection attempt while a broker is down, which
+    # is a wall of text saying one thing. /api/status reports it once, accurately.
+    org.apache.kafka.clients.NetworkClient: ERROR
+    org.apache.kafka.clients.consumer.internals: WARN

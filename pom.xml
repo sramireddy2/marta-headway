@@ -17,6 +17,7 @@
     <module>headway-gtfs</module>
     <module>headway-ingest</module>
     <module>headway-stream</module>
+    <module>headway-api</module>
   </modules>
 
   <properties>
@@ -31,6 +32,13 @@
     -->
     <exec.skip>true</exec.skip>
     <exec.mainClass>none</exec.mainClass>
+    <!--
+      Same problem, same shape, different plugin. `mvn -pl headway-api -am spring-boot:run` also
+      visits the parent and headway-common, neither of which has a Spring application in it, and
+      the run goal fails there with "Unable to find a suitable main class". Default it to skip;
+      headway-api sets it back to false.
+    -->
+    <spring-boot.run.skip>true</spring-boot.run.skip>
 
     <gtfs.rt.bindings.version>0.2.0</gtfs.rt.bindings.version>
     <guava.version>33.6.0-jre</guava.version>
@@ -40,9 +48,16 @@
     <micrometer.version>1.17.0</micrometer.version>
     <!-- Must match the apache/spark image tag in docker-compose.yml. -->
     <spark.version>4.1.3</spark.version>
+    <spring.boot.version>3.5.3</spring.boot.version>
     <slf4j.version>2.0.16</slf4j.version>
     <awaitility.version>4.3.0</awaitility.version>
-    <logback.version>1.5.12</logback.version>
+    <!--
+      logback-classic and logback-core are two jars that must move together; they share
+      package-private API. Pinning only classic left core to be resolved by Spring Boot's BOM,
+      which produced classic 1.5.12 against core 1.5.18 and an AbstractMethodError the instant
+      anything tried to log. Both are managed below against this one property.
+    -->
+    <logback.version>1.5.18</logback.version>
     <junit.version>5.11.3</junit.version>
     <assertj.version>3.26.3</assertj.version>
   </properties>
@@ -125,6 +140,11 @@
         <artifactId>logback-classic</artifactId>
         <version>${logback.version}</version>
       </dependency>
+      <dependency>
+        <groupId>ch.qos.logback</groupId>
+        <artifactId>logback-core</artifactId>
+        <version>${logback.version}</version>
+      </dependency>
 
       <dependency>
         <groupId>org.junit</groupId>
@@ -138,6 +158,19 @@
         <artifactId>assertj-core</artifactId>
         <version>${assertj.version}</version>
       </dependency>
+
+      <!--
+        Spring Boot's BOM is deliberately NOT imported here. It lives in headway-api's own pom.
+
+        It was here first, and it broke Spark. Boot's BOM pins several hundred artifacts, most of
+        which have nothing to do with Spring - Netty among them. Importing it in the parent applied
+        Boot's Netty 4.1 to every module, including headway-stream, where Spark 4.1 needs 4.2 and
+        died with NoClassDefFoundError: io/netty/channel/nio/NioIoHandler. Nothing in the API module
+        was involved; the damage was entirely in a sibling that had never heard of Spring.
+
+        The lesson generalises: a BOM is not a suggestion for the module that wants it, it is a
+        constraint on everything that inherits it. Scope one to the module that needs it.
+      -->
     </dependencies>
   </dependencyManagement>
 
@@ -162,6 +195,19 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
           <version>3.13.0</version>
+          <configuration>
+            <!--
+              Keep method parameter names in the class file. Without this, javac discards them and
+              anything doing reflection sees arg0, arg1. Spring Boot's own starter-parent sets it
+              for exactly this reason, and this build deliberately does not inherit from that pom -
+              so it has to be set here.
+
+              The symptom when it is missing is not a compile error. It is a 500 at runtime on the
+              first request to a handler with an unnamed @PathVariable, which is how it was found:
+              "Name for argument of type [java.lang.String] not specified".
+            -->
+            <parameters>true</parameters>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
@@ -180,6 +226,11 @@
             <mainClass>${exec.mainClass}</mainClass>
             <skip>${exec.skip}</skip>
           </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-maven-plugin</artifactId>
+          <version>${spring.boot.version}</version>
         </plugin>
       </plugins>
     </pluginManagement>

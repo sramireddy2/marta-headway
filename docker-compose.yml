@@ -90,9 +90,22 @@ services:
       HEADWAY_HEADWAY_TOPIC: route-headways
       HEADWAY_STARTING_OFFSETS: latest
       HEADWAY_GTFS_DIR: /data/gtfs
-      HEADWAY_CHECKPOINT_DIR: /data/spark-checkpoint
+      # INSIDE the container, not on the bind mount — and that placement is load-bearing.
+      #
+      # A streaming checkpoint's commit protocol assumes atomic file renames. A Windows bind
+      # mount does not honestly provide them, and this project lives under OneDrive, whose sync
+      # touches files underneath Spark. The observed failures were CONCURRENT_STREAM_LOG_UPDATE
+      # ("multiple streaming jobs" — there was one) and a state-store row that failed validation
+      # nobody had corrupted. Both vanished on a Linux filesystem.
+      #
+      # The cost: recreating the container starts from a blank checkpoint at 'latest' offsets,
+      # so the first minute of windows is rebuilt from live data. For a dev dashboard whose
+      # checkpoint we deliberately wipe on every query change anyway, that is nothing.
+      HEADWAY_CHECKPOINT_DIR: /tmp/spark-checkpoint
     volumes:
       - ./headway-stream/target:/app:ro
+      # Read-write: the GTFS downloader refreshes its cached zip here. Plain files are fine on
+      # the bind mount — it is only the checkpoint's rename dance that cannot live on it.
       - ./data:/data
     command:
       - /opt/spark/bin/spark-submit

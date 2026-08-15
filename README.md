@@ -46,7 +46,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 | 6 | Project GPS onto route shape → "distance along route" | ✅ |
 | 7 | Spark Structured Streaming headway computation | ✅ |
 | 8 | Bunching / gapping detection + alert topic | ✅ |
-| 9 | Spring Boot REST + WebSocket API | ☐ |
+| 9 | Spring Boot REST + WebSocket API | ✅ |
 | 10 | Leaflet live map front-end | ☐ |
 | 11 | Concurrency hardening (StampedLock / Striped locks) + benchmarks | ☐ |
 
@@ -764,11 +764,13 @@ runs today". On a Saturday that folded every weekday trip back in, roughly halvi
 scheduled headway and reporting a correctly spaced fleet as bunched. Only a genuinely absent
 calendar disables filtering now.
 
-### An honest limitation
+### An honest limitation — closed in step 9
 
-Sliding windows mean the same event appears in two or three overlapping windows, so alerts repeat.
-Records are keyed by `headwayGroup`, so a compacted topic or a consumer keeping the latest per key
-collapses them — but as it stands a dispatcher would see the same bunching two or three times.
+Sliding windows mean the same event appears in two or three overlapping windows, so alerts repeat
+on the topic. That is inherent to the log: records are keyed by `headwayGroup`, and collapsing
+repeats needs a small piece of state that remembers what is already alerting — which a streaming
+aggregation deliberately does not have across windows. Step 9's `AlertTracker` is that state, and
+the topic itself still carries every measurement, which is what makes the dedup auditable.
 
 ### The finding that shaped step 8
 
@@ -782,6 +784,110 @@ Route 89 direction 0 reported a 38.1 m gap in every window. Pulling the full rec
 Vehicles 3503 and 3694 sat at 0.0 m and 38.1 m, unchanged across three windows spanning 90
 seconds. They were **parked at the terminal**, not bunched — and the exact `0.0` is step 6's
 clamping, meaning 3503 was at or before the route start. Fixed by the layover filter above.
+
+## The API (step 9)
+
+The front door: everything the pipeline computes, served to anything with HTTP.
+
+```bash
+.\mvnw.cmd -pl headway-api -am spring-boot:run
+```
+
+```
+Kafka route-headways ────┐
+                         ├──▶ one consumer thread each ──▶ ConcurrentHashMaps ──┬──▶ REST       (ask)
+Kafka vehicle-positions ─┘                                                      └──▶ WebSocket  (listen)
+```
+
+Nothing in this module computes a headway. Everything it serves was decided by the Spark job; the
+value added is **shape**. A topic is a *log of measurements*; a dashboard needs *current state*.
+Those are different data structures, and turning one into the other is the whole job. Two
+consequences fall out: all state is a projection and can be rebuilt by re-reading the topic, so
+nothing is persisted and a restart costs one batch interval; and repeated measurements of one event
+are a property of the log, not of reality, so collapsing them belongs here.
+
+| Endpoint | Answers |
+|----------|---------|
+| `GET /api/routes` | every route:direction being measured, worst first (`?alertingOnly=true` to filter) |
+| `GET /api/routes/10:1` | one group |
+| `GET /api/alerts` | current problems, as **episodes**, not window records |
+| `GET /api/alerts/history` | recently resolved episodes |
+| `GET /api/vehicles` | last known position of every bus (`?routeId=` to filter) — the map's data |
+| `GET /api/snapshot` | exactly what a WebSocket frame contains, for anything that would rather poll |
+| `GET /api/status` | the counters that distinguish "quiet network" from "broken pipeline" |
+| `ws://…/ws/live` | a full snapshot on connect, then one per second |
+
+### Episodes: the duplicate-alert fix
+
+The stream job's sliding windows report one three-minute bunching event six or more times. All six
+are correct measurements; all six describe one event. `AlertTracker` collapses them: an episode
+**opens** on the first alertable window for a group, **absorbs** every window that agrees,
+**escalates** if the status worsens, and **closes** on recovery — or is swept closed after three
+minutes of silence, because a route whose buses go out of service never says goodbye.
+
+Measured live: **17 episodes opened, 98 windows absorbed** — those 98 were each a duplicate alert
+in the step 8 output. The tracker also keeps `worstStatus` separately from the current one, because
+"how bad did it get" (triage) and "is it recovering" (monitoring) are different questions; live
+data showed route 89 at `worst=SEVERE_BUNCHING now=BUNCHING` mid-recovery.
+
+### The state itself: same rule, new clock
+
+`LiveHeadwayState` is `VehicleStore` from step 2 with a different clock: apply an update only if it
+is not older than what is held, inside one atomic `compute`. Here the gate is the window end rather
+than the GPS timestamp, and it earns its keep immediately — Spark's Update mode re-emits windows
+when late data refines them, and a live run rejected **252** stale re-emissions that would each
+have made the dashboard jump backwards in time.
+
+### Fan-out: the slow-client problem
+
+One thread serialises each snapshot once and sends the same bytes to every socket. Two guards make
+that safe. Each session is wrapped in Spring's `ConcurrentWebSocketSessionDecorator` — sessions are
+not thread-safe, and interleaved writes splice two frames into a protocol error — with a 512 KB
+buffer cap that **disconnects** a client that falls behind: a client half a megabyte behind is
+looking at a map minutes old, so the connection has already failed; reconnecting costs it one
+second. And ticks flow through a `Conflator` that keeps only the newest pending snapshot — when the
+sender is slow, obsolete frames are never queued at all. Same bounded-buffer argument as step 4, at
+the other end of the pipeline.
+
+### What step 9 broke, in order
+
+- **Spring Boot's BOM in the parent pom killed Spark.** See [Module layout](#module-layout). The
+  BOM now lives in `headway-api/pom.xml` only, with Jackson and Kafka re-pinned *above* the import,
+  because the first matching entry wins.
+- **Split logback.** Pinning only `logback-classic` (1.5.12) let Boot's BOM pick `logback-core`
+  (1.5.18); they share internals and the mismatch was an `AbstractMethodError` on the first log
+  line. Both are now pinned to one property.
+- **`-parameters` was never set.** javac discards method parameter names by default; Spring needs
+  them to bind `@PathVariable`. Boot's starter-parent sets the flag, this build deliberately
+  doesn't inherit it, so every handler 500'd on first request. Now set in the parent's compiler
+  config.
+- **The Spark checkpoint cannot live on a Windows bind mount.** Its commit protocol assumes atomic
+  renames; a bind mount under OneDrive does not honestly provide them. The job died with
+  `CONCURRENT_STREAM_LOG_UPDATE` ("multiple streaming jobs" — there was one) and a state-store
+  validation failure on rows nobody corrupted. The checkpoint now lives inside the container's own
+  filesystem; recreating the container costs one minute of rebuilt windows.
+- **`durationSeconds` was missing from the wire.** Jackson auto-detects `getX()` accessors and
+  record components; a method named `durationSeconds()` is neither. Found by reading live output —
+  the round-trip test recomputed the value after parsing and never noticed. The test now asserts
+  against the raw JSON.
+
+### It works
+
+Live run, 2026-08-15, with ingest, Kafka, Spark and the API all up:
+
+```
+GET /api/status   routes: 39   vehicles: 177   openAlerts: 15
+                  headwayRecords: 559   staleRecords: 252   malformedRecords: 0
+                  alertsOpened: 17   alertsAbsorbed: 98   alertsCleared: 3
+
+GET /api/alerts   17 open episodes, worst first:
+ 165:0  Fairburn Road / Camp Creek   worst=SEVERE_BUNCHING  ratio=0.04  dur=150s  windows=8
+  89:1  Old National Highway         worst=SEVERE_BUNCHING  ratio=0.02  dur=120s  windows=7
+  15:1  Clifton Road / Candler Road  worst=SEVERE_GAPPING   ratio=2.98  dur=120s  windows=6
+```
+
+WebSocket verified from a real browser: full snapshot on connect, then one ~84 KB frame per second
+— 48 routes, 20 episodes, 179 buses per frame.
 
 ## Troubleshooting
 
@@ -806,7 +912,8 @@ headway-parent          the root pom: dependency versions, Java level, module li
 ├── headway-common      domain model + the JSON contract (VehiclePosition, Json)
 ├── headway-gtfs        the scheduled feed: routes, trips, shapes, projection geometry
 ├── headway-ingest      polls GTFS-Realtime, decodes protobuf, publishes to Kafka
-└── headway-stream      Spark job: Kafka -> windowed headways -> Kafka
+├── headway-stream      Spark job: Kafka -> windowed headways -> Kafka
+└── headway-api         Spring Boot: Kafka -> in-memory state -> REST + WebSocket
 ```
 
 `headway-gtfs` deliberately does **not** depend on `headway-common`: it knows about the scheduled
@@ -818,10 +925,13 @@ position *is* and how it is written as JSON; how those bytes get transported is 
 concern, and Spark in step 7 will read the same JSON without going through Kafka's serializer API
 at all.
 
-More modules arrive with later steps (`headway-stream` for Spark, `headway-api` for Spring Boot).
-They are kept separate on purpose: Spark and Spring Boot both drag in large, opinionated,
-*conflicting* dependency trees (notably different Jackson versions). Separate modules means
-separate classpaths and no version war.
+`headway-stream` and `headway-api` are separate modules on purpose, and step 9 proved why more
+sharply than expected. Spring Boot's BOM was first imported into the *parent* pom so every module
+could see it. That pinned Netty 4.1 across the whole build, and Spark 4.1 — which needs Netty 4.2 —
+died with `NoClassDefFoundError: io/netty/channel/nio/NioIoHandler`. Nothing in the API module was
+involved; the damage was entirely in a sibling that had never heard of Spring. The BOM now lives in
+`headway-api/pom.xml` where it constrains one module. **A BOM is not a suggestion for the module
+that wants it — it is a constraint on everything that inherits it.**
 
 ## Data sources
 
