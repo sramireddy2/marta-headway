@@ -98,6 +98,10 @@ services:
       # ("multiple streaming jobs" — there was one) and a state-store row that failed validation
       # nobody had corrupted. Both vanished on a Linux filesystem.
       #
+      # This line is the entire fix, confirmed by experiment: the state-store validator was
+      # briefly blamed and switched off as well, but re-enabling it here changes nothing — the
+      # job runs clean. Two changes were made at once and only this one mattered.
+      #
       # The cost: recreating the container starts from a blank checkpoint at 'latest' offsets,
       # so the first minute of windows is rebuilt from live data. For a dev dashboard whose
       # checkpoint we deliberately wipe on every query change anyway, that is nothing.

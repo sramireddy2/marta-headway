@@ -90,27 +90,25 @@ public final class HeadwayStreamMain {
                 // dominates the actual work. This is the single most common local-Spark slowdown.
                 .config("spark.sql.shuffle.partitions", "8")
                 .config("spark.sql.session.timeZone", "UTC")
-                // Spark validates the byte layout of every row it writes to the state store. The
-                // aggregation buffer here is [collect_list's opaque blob, max(shapeLengthMetres)],
-                // and the validator's arithmetic disagrees with what collect_list actually wrote by
-                // eight bytes, which aborts the query on the first batch that has to reload state:
+                // Deliberately NOT setting spark.sql.streaming.stateStore.formatValidation.enabled.
+                //
+                // Step 9 hit this failure on the first batch that reloads state:
                 //
                 //   VALUE_ROW_FORMAT_VALIDATION_FAILURE ... field: StructField(buf,BinaryType,true)
                 //   numFields: 2, bitSetWidthInBytes: 8, rowSizeInBytes: 240
                 //   index: 0 ... offset: 16, size: 224
                 //
-                // 8 + 16 + 224 is 248, not 240. collect_list is a TypedImperativeAggregate, so its
-                // buffer is an opaque serialised blob rather than a normal Catalyst value, and the
-                // validator does not account for it correctly.
+                // 8 + 16 + 224 is 248, not 240, which looks exactly like a Spark bug in how
+                // collect_list's opaque aggregation buffer is measured - so the validator was
+                // switched off and the checkpoint was moved off the Windows bind mount at the same
+                // time. That fixed it, and left no way to know which change was responsible.
                 //
-                // Turning the check off is not free: it exists to catch a restart against a
-                // checkpoint written by an incompatible query, which would otherwise produce
-                // silently wrong results instead of an error. That risk is accepted here because
-                // the alternative is a job that cannot run at all, and because this deployment
-                // discards the checkpoint whenever the query changes. If the aggregation is ever
-                // rewritten to avoid collect_list, delete this line first and see if it is still
-                // needed.
-                .config("spark.sql.streaming.stateStore.formatValidation.enabled", "false")
+                // Settled by experiment: with the checkpoint on the container's own filesystem and
+                // validation back ON, the job ran clean through batches 0-6 with 63 route-direction
+                // groups of live state reloaded on every one. The validator was never the problem.
+                // The bind mount was - see docker-compose.yml. The plausible diagnosis above was
+                // simply wrong, and disabling the check would have removed the guard against
+                // restarting on an incompatible checkpoint for nothing.
                 .getOrCreate();
         spark.sparkContext().setLogLevel("WARN");
 

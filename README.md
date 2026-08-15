@@ -865,7 +865,35 @@ the other end of the pipeline.
   renames; a bind mount under OneDrive does not honestly provide them. The job died with
   `CONCURRENT_STREAM_LOG_UPDATE` ("multiple streaming jobs" — there was one) and a state-store
   validation failure on rows nobody corrupted. The checkpoint now lives inside the container's own
-  filesystem; recreating the container costs one minute of rebuilt windows.
+  filesystem; recreating the container costs one minute of rebuilt windows. See below — this one
+  came with a lesson attached.
+
+### Two changes at once, and how to undo that
+
+The state-store failure looked like a Spark bug. The error arithmetic supported it —
+`bitSetWidthInBytes: 8`, field `offset: 16, size: 224`, but `rowSizeInBytes: 240`, when 8 + 16 +
+224 is 248 — and `collect_list` stores an opaque serialised buffer that a validator could plausibly
+mis-measure. So the validator was disabled *and* the checkpoint was moved off the bind mount, in the
+same edit. The job came up. Nothing was learned.
+
+That is a bad place to stop, because the fix carried a real cost:
+`stateStore.formatValidation.enabled=false` removes the guard that catches a restart against an
+incompatible checkpoint, turning a loud failure into silently wrong output. Paying that for a
+change that may have done nothing is worse than not knowing.
+
+Settled by re-running with the validator **on** and the checkpoint on the container filesystem:
+
+```
+=== batch 0: 0 route-direction groups with 2+ buses ===
+=== batch 1: 58 route-direction groups with 2+ buses ===   <- previously died here
+=== batch 2: 63 ===   === batch 3: 63 ===   === batch 4: 68 ===
+```
+
+Batch 1 is the first batch that reloads state, and it is exactly where the query used to abort.
+Clean through batch 6 with ~60 groups of live state reloaded every time. **The validator was never
+the problem; the bind mount was.** The `formatValidation` line is gone and the diagnosis that
+justified it is recorded in `HeadwayStreamMain` as wrong, because a plausible wrong explanation
+left in a comment is worse than no comment.
 - **`durationSeconds` was missing from the wire.** Jackson auto-detects `getX()` accessors and
   record components; a method named `durationSeconds()` is neither. Found by reading live output —
   the round-trip test recomputed the value after parsing and never noticed. The test now asserts
