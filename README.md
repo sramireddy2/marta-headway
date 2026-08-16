@@ -1,991 +1,60 @@
 # Headway
 
-**A real-time bus bunching detector for MARTA (Atlanta).**
+**Watches Atlanta's buses in real time and spots when they bunch up.**
 
-Buses on a route are supposed to be evenly spaced. If a bus comes every 10 minutes, the gap — the
-**headway** — between consecutive buses should be 10 minutes. In practice they clump:
+If a bus is supposed to come every 10 minutes, you should never wait 25 and then see three arrive
+together. But that is exactly what happens, everywhere, constantly. Headway reads MARTA's live bus
+feed, works out how far apart the buses actually are, compares that to the timetable, and shows the
+problem on a map as it happens.
 
-- One bus runs slightly late.
-- Being late, it finds more passengers waiting at each stop, so it dwells longer and falls further behind.
-- The bus behind it finds *fewer* passengers, so it speeds up and closes the gap.
-- The feedback loop runs away. Eventually three buses arrive nose-to-tail, followed by a 30-minute hole.
-
-This is **bus bunching**, and it is the single largest cause of unreliable transit. Agencies want to
-see it *live*, because the fixes — holding a bus at a stop, short-turning it, expressing it past
-stops — only work in the moment.
-
-Headway ingests MARTA's live GTFS-Realtime feed, computes the actual headway between consecutive
-buses on each route, flags bunching and gapping as it happens, and serves it over a REST/WebSocket
-API and a live map.
+It is a learning project, built in the open, with every claim measured rather than asserted. When
+something surprised me — and a lot did — it is written down here, including the times I was wrong.
 
 ---
 
-## Architecture (target)
+## Why buses bunch
 
-```
-MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ──▶  Spark Structured   ──▶  Kafka
-(protobuf over HTTP)            (Java 21,            topic:      Streaming              topic:
- every ~15-30s                   virtual threads,    vehicle-    (window + watermark,    headway-
-                                 bounded queue,      positions    project onto route      alerts
-                                 rate limiter)       keyed by     shape, sort, diff)         │
-                                                     route_id                                │
-                                                                                             ▼
-                                        Browser  ◀──WebSocket──  Spring Boot API  ◀──consume──
-                                     (Leaflet map)   + REST       (Jackson)
-```
+This is the thing worth understanding, and it takes one minute.
 
-## Status
+Imagine four buses evenly spaced on a route. Now one of them hits a red light and falls a minute
+behind.
 
-| Step | What it adds | Done |
-|------|--------------|:----:|
-| 1 | Repo skeleton, Maven build, GTFS-Realtime protobuf decoding | ✅ |
-| 2 | Scheduled polling, rate limiting, idempotent concurrent store | ✅ |
-| 3 | Kafka in Docker + producer keyed by route | ✅ |
-| 4 | Bounded sharded queue, backpressure, virtual threads, Micrometer | ✅ |
-| 5 | Static GTFS (routes, trips, shapes) + Guava LoadingCache | ✅ |
-| 6 | Project GPS onto route shape → "distance along route" | ✅ |
-| 7 | Spark Structured Streaming headway computation | ✅ |
-| 8 | Bunching / gapping detection + alert topic | ✅ |
-| 9 | Spring Boot REST + WebSocket API | ✅ |
-| 10 | Leaflet live map front-end | ✅ |
-| 11 | Concurrency benchmarks (JMH) + a measured optimisation | ✅ |
+1. Running late, it arrives at the next stop to find **more** people waiting — because more time has
+   passed since the last bus.
+2. More people means longer to board, so it falls **further** behind.
+3. Meanwhile the bus behind it finds **fewer** people waiting, boards quickly, and **catches up**.
+4. Repeat.
+
+The gap does not recover. It collapses. Within a few stops the two buses are nose to tail, and
+behind them is a hole where a bus should have been. Riders at those stops wait three times as long
+as the timetable promised, and then watch two buses arrive at once.
+
+This is called **bus bunching**, and it is the single biggest cause of unreliable transit. The
+fixes — holding a bus at a stop for a minute, sending it express past a few stops, turning it
+around early — only work *while it is happening*. Which means someone has to see it happening.
+
+That is what this project builds.
+
+**"Headway"** is the transit word for the gap between consecutive buses. Ten-minute headway means a
+bus every ten minutes.
 
 ---
 
-## Requirements
-
-- **JDK 21.** Not 25 — Apache Spark supports 17 and 21 only, and step 7 depends on it.
-- **Docker Desktop**, running. Kafka lives in Compose from step 3 onward.
-- Nothing else. Maven is supplied by the wrapper (`mvnw` / `mvnw.cmd`), which downloads itself.
-
-### Set JAVA_HOME
-
-The Maven wrapper reads `JAVA_HOME`, and it must point at the JDK **folder** — not at
-`java.exe`, and not at a path that no longer exists. Check it:
-
-```bash
-echo $env:JAVA_HOME
-```
-
-If it is wrong, set it once (PowerShell), then **open a new terminal** — environment changes only
-apply to shells started afterwards:
-
-```bash
-[Environment]::SetEnvironmentVariable("JAVA_HOME","C:\Program Files\Eclipse Adoptium\jdk-21.0.9.10-hotspot","User")
-```
-
-## Build and run
-
-### Start Kafka
-
-```bash
-docker compose up -d
-```
-
-Wait until it reports healthy (about 20 seconds):
-
-```bash
-docker compose ps
-```
-
-`docker compose down` stops it and keeps the data; `docker compose down -v` wipes the log too.
-
-> **PowerShell users:** PowerShell will not run a script from the current directory without a
-> leading `.\`, and it needs the `.cmd` extension. Use `.\mvnw.cmd`. In Git Bash, macOS, or Linux
-> use `./mvnw` instead.
-
-Run the tests:
-
-```bash
-.\mvnw.cmd -B test
-```
-
-Poll the live MARTA feed continuously, hold every bus in memory, and publish each position to
-Kafka. Ctrl+C to stop:
-
-```bash
-.\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests
-```
-
-Configuration comes from the environment, with working defaults:
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `HEADWAY_KAFKA_BOOTSTRAP` | `localhost:9092` | Broker address |
-| `HEADWAY_KAFKA_TOPIC` | `vehicle-positions` | Destination topic |
-
-Expected output (numbers vary — this is a live feed):
-
-```
-Starting ingest: poll every 15s, ceiling 0.0667 req/s, evict after 10min
-poll: 186 received | 186 new,   0 updated,   0 stale, 0 rejected | 186 vehicles on 65 routes | 1122ms
-poll: 186 received |   0 new, 180 updated,   6 stale, 0 rejected | 186 vehicles on 65 routes |   47ms
-poll: 186 received |   0 new,   0 updated, 186 stale, 0 rejected | 186 vehicles on 65 routes |   22ms
-poll: 186 received |   0 new, 181 updated,   5 stale, 0 rejected | 186 vehicles on 65 routes |   20ms
-poll: 186 received |   0 new,   0 updated, 186 stale, 0 rejected | 186 vehicles on 65 routes |   23ms
-```
-
-| Column | Meaning |
-|--------|---------|
-| `received` | Vehicles in the file MARTA just served |
-| `new` | A vehicle id not currently in the store |
-| `updated` | A strictly newer reading replaced the stored one |
-| `stale` | Duplicate or out-of-order — dropped, and entirely normal |
-| `rejected` | Refused at the door: already older than the freshness window, or future-dated |
-
-**Every other poll is 100% stale.** MARTA republishes roughly every 30 seconds, so a 15-second poll
-fetches the byte-identical file half the time. The idempotency check absorbs the whole duplicate
-batch and the store does not move.
-
-That is not a bug to tune away. Polling faster than the publish rate is deliberate: you do not know
-the publisher's phase, so the only way to see a new file promptly is to ask more often than it
-changes. The correctness property that makes it safe — a re-delivered message is a no-op — is the
-same one that will let you replay a Kafka topic from the beginning in step 3 without corrupting
-anything.
-
-### Freshness: one threshold, both directions
-
-A vehicle whose GPS transponder freezes stays listed in the feed forever with an unchanging
-timestamp. An earlier version admitted such a vehicle (its id was not in the store, so it looked
-"new"), and the eviction sweep then removed it a minute later, and the next poll re-added it —
-once a minute, indefinitely. Admission and eviction disagreed about what "too old" meant.
-
-`VehicleStore` now takes a single `maxAge` and uses it for **both**, so the invariant holds by
-construction: *nothing can be admitted that the next sweep would immediately remove.* Readings
-more than two minutes in the future are refused for a related reason — nothing would ever look
-newer than them, and they would never age past the cutoff, so they would be permanently stuck.
-
-Runs late at night will show far fewer vehicles. Zero vehicles is normal around 2–4 AM.
-
-## Kafka
-
-Topic `vehicle-positions`, 6 partitions, **keyed by `routeId`**, values as JSON.
-
-```
-Partition:0  15  {"vehicleId":"2322","routeId":"15","tripId":"10785433","directionId":5,
-                  "latitude":33.79291915893555,"longitude":-84.3209228515625,
-                  "bearingDegrees":null,"speedMetersPerSecond":null,
-                  "timestamp":"2026-08-14T22:54:08Z"}
-```
-
-### Why the key is the route
-
-Kafka guarantees ordering **within a partition** and promises nothing across partitions. A keyed
-record is hashed to a partition, so every record sharing a key stays in one partition, in order.
-
-Headway compares buses on the same route against each other. Spread route 15 across six partitions
-and a consumer can read 10:00:30 for one bus before 10:00:15 for the bus ahead of it, then compute
-a gap from two readings that never coexisted. Keying by route makes that impossible.
-
-Keying by `vehicleId` is the tempting mistake — it balances load more evenly, and it destroys
-exactly the ordering the calculation needs. **The key follows the query you intend to run, not the
-load distribution.**
-
-Verified against the running broker: 547 records over 65 routes, spread across all 6 partitions,
-with **zero routes split across more than one partition**.
-
-```bash
-docker exec headway-kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic vehicle-positions
-```
-
-### Producer settings that matter
-
-| Setting | Value | Why |
-|---------|-------|-----|
-| `acks` | `all` | A leader can acknowledge and die before any follower has the record. With one local replica this is free; it is already correct when it stops being free. |
-| `enable.idempotence` | `true` | A retry after a lost acknowledgement would otherwise duplicate the record. The broker dedupes by sequence number — the same property `VehicleStore` enforces in memory, now enforced on the wire. |
-| `linger.ms` | `20` | ~190 records per poll leave as a few requests instead of 190 round trips. |
-| `max.block.ms` | `10000` | The default 60s means a dead broker looks like a hang rather than an error. |
-
-`send()` is asynchronous — it buffers and returns. Calling `.get()` on the returned future per
-record makes it synchronous and collapses throughput; the publisher uses a callback instead.
-
-## The ingest pipeline
-
-```
- scheduler          fetch pool           bounded sharded queue          workers
- 1 platform thread  virtual threads      4 shards x 256 slots           4 platform threads
-      |                   |                       |                          |
-  every 15s -------> submit fetch ------> put() blocks when full ----> store + Kafka
-                     (blocking HTTP)      route -> shard by hash       1 worker per shard
-```
-
-### Backpressure: why the queue is bounded
-
-An unbounded queue does not remove a bottleneck, it hides one. If consumers are slower than
-producers it grows until the heap is gone, and the failure mode is the worst available: minutes of
-rising latency and GC thrash, then `OutOfMemoryError`, with the real cause — a slow consumer —
-nowhere in the stack trace.
-
-A bounded queue turns that into something benign. When it fills, `put()` **blocks the producer**.
-Fetching stops. Memory stays flat. The system runs at the speed of its slowest stage, which is the
-fastest it could correctly go anyway.
-
-That is backpressure: slowness propagating upstream as a *signal* instead of accumulating as
-garbage. Note that a bound of one million is an unbounded queue with extra steps — the bound has to
-be small enough that blocking happens before memory gets interesting.
-
-`ShardedPositionQueueTest.backpressureBlocksTheProducer` proves both halves against a deliberately
-slow consumer: the producer records real blocked time, **and** the queue never exceeds its bound.
-The second assertion is the one that matters — without the bound the test would pass faster and the
-queue would have grown to 40 items, which is the start of the curve that ends in an OOM.
-
-#### Seeing it happen live
-
-At the default 1024 slots against ~190 positions per poll the queue never fills, so the mechanism
-never engages. Shrink it to prove it works:
-
-```bash
-$env:HEADWAY_QUEUE_CAPACITY = "4"
-```
-
-16 total slots against 175-position batches. Real output:
-
-```
-Starting ingest: ... 4 shards x 4 = 16 queue slots
-poll: 176 positions enqueued in 914ms (400ms BLOCKED on a full queue) | queue 0/16
-poll: 176 positions enqueued in  32ms ( 12ms BLOCKED on a full queue) | queue 6/16
-metrics | fetched 702 -> enqueued 702 -> processed 702 | queue 0/16 0% | blocked 434ms total
-        | kafka 702 sent / 0 failed
-```
-
-**fetched 702 → enqueued 702 → processed 702 → 702 published, with a queue eleven times too small
-to hold one batch.** Nothing was dropped and memory never moved; the producer simply waited. Unset
-the variable to go back to the normal configuration.
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `HEADWAY_QUEUE_SHARDS` | `4` | Shards, and therefore workers |
-| `HEADWAY_QUEUE_CAPACITY` | `256` | Slots per shard |
-
-### Why sharded, and not one queue
-
-One queue with four workers would give parallelism and quietly break step 3. Two workers pulling
-consecutive route-15 readings can call `producer.send()` in either order, so records reach the
-partition out of sequence — destroying the ordering that keying by route exists to provide.
-
-So the queue is split into shards, a route is assigned to one by hashing its id, and **each shard is
-drained by exactly one worker**. Route 15 is always shard 3, always worker 3, always published in
-arrival order. Parallel across routes, strictly ordered within one — the same idea as the Kafka
-partitioning it protects, and the same idea as Guava's `Striped` locks in step 11.
-
-The trade-off is real: an unusually busy route makes its shard the slow one and no other worker can
-help. With ~65 routes over 4 shards that is a rounding error, and correctness is not worth trading
-for it.
-
-### Three thread types, chosen separately
-
-| Stage | Threads | Why |
-|-------|---------|-----|
-| Scheduler | 1 platform | Java 21 has no virtual-thread scheduled executor and this thread only submits. Keeping the timer off the work pool stops a slow fetch delaying the next tick. |
-| Fetches | Virtual | A fetch is almost all socket wait. A platform thread parked on I/O costs ~1 MB of stack and an OS scheduler slot; a virtual thread costs a few hundred bytes because the JVM unmounts it while it waits. |
-| Workers | 4 platform, fixed | Workers do CPU work on in-memory data. Virtual threads make *blocking* cheap, not computation faster, and one per task would create unbounded concurrency over bounded CPU. The count is fixed by ordering anyway — one per shard. |
-
-**Virtual threads for waiting, platform threads for working.** With a single feed today the virtual
-thread benefit is latent, not measured; the point is that adding the trip-updates feed in step 5 and
-other agencies later costs nothing.
-
-### Shutdown order
-
-Scheduler → fetch pool → workers (which drain their shard first) → then the caller flushes Kafka.
-Reversing any two loses data: stop workers first and the queue is abandoned; flush Kafka first and
-the last records are produced after the flush.
-
-## Metrics
-
-Micrometer, currently against an in-memory `SimpleMeterRegistry` logged every 30 seconds. Step 9
-swaps in Spring Boot's Prometheus registry and the same meters appear over HTTP with no call-site
-changes.
-
-The two that matter are `headway.queue.utilization` and `headway.enqueue.wait`. A pipeline that is
-coping and one that is a single slow consumer away from stalling look identical from outside —
-same log lines, same throughput — right up until they are not. The difference lives entirely in how
-full the queue is and how long producers spend blocked.
-
-## The scheduled feed
-
-`headway-gtfs` downloads `google_transit.zip` and parses the three files the headway calculation
-needs. Check coverage against the live feed:
-
-```bash
-.\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests "-Dexec.mainClass=dev.headway.ingest.GtfsCoverageMain"
-```
-
-```
-Loaded static GTFS in 1229ms: 86 routes, 52401 trips, 215 shapes, published 2026-06-24
-Live feed: 176 vehicles
-RESOLVED 176 of 176 vehicles (100.0%)
-  no trip_id in the realtime feed : 0
-  trip_id not in trips.txt        : 0
-  route short name not in routes  : 0
-  direction split: {direction 0=82, direction 1=94}
-   2309 -> route 2 (Donald Lee Hollowell/Ponce de Leon) | dir 0 | Candler Park Stn | shape 136095, 8.6 km
-```
-
-**100% of live vehicles resolve to a route, a direction and a path.** That was the open question
-from step 3, and it is the precondition for step 6 — a vehicle that cannot be resolved has no
-direction and no shape, so it cannot take part in a headway calculation at all.
-
-### Joining realtime to scheduled: two ids, two different answers
-
-| Realtime field | Joins to | Verified |
-|---|---|---|
-| `trip_id` | `trips.trip_id` — direct match | 6/6 sampled ids found |
-| `route_id` | `routes.route_short_name`, **not** `routes.route_id` | 9/9 matched short name, **0/9** matched route_id |
-
-A realtime bus on Clifton Road reports `route_id: "15"`. In `routes.txt` that row's `route_id` is
-`26913` and its `route_short_name` is `15`. Joining on `route_id` matches nothing — and as a left
-join it fails *silently*, enriching every route to null while the pipeline keeps running. Hence
-`GtfsSnapshot.routeForRealtimeId(...)`, named so the mistake is hard to make.
-
-### direction_id, resolved
-
-The realtime feed's `direction_id` is unusable (5, 9, 11, 14, 17, null — no 0 or 1). The static
-feed's is correct: **26,549 trips with direction 0 and 25,852 with direction 1**, nothing else. So
-direction comes from `trips.txt` via `trip_id`, and `TripContext.headwayGroup()` returns
-`route:direction` — the key that groups buses which can meaningfully bunch with each other.
-
-### Data facts worth knowing
-
-- `shape_dist_traveled` is in **kilometres**. Verified by summing haversine along shape 136092:
-  10,815 m against a final value of 10.8389, a ratio of 997.8 m per unit. Converted to metres at
-  parse time so one unit exists everywhere else.
-- All 359,676 shape points across 215 shapes are present, in sequence, and monotonic — but the
-  loader validates rather than assumes, and falls back to computing haversine distances for feeds
-  that leave the column blank.
-- `frequencies.txt` is **absent**, so scheduled headway in step 8 has to be derived from
-  `stop_times.txt` rather than read off directly.
-
-### Two performance decisions
-
-**`ZipFile`, not `ZipInputStream`.** Uncompressed the archive is ~147 MB, and 126 MB of that is
-`stop_times.txt`, which is not needed until step 8. `ZipInputStream` would decompress every entry
-in order to reach the ones we want; `ZipFile` reads the central directory and opens only the three
-we need, so `stop_times.txt` is never decompressed at all.
-
-**Shapes as three `double[]`, not a `List<Point>`.** 359,676 points as objects means 359,676 heap
-allocations reached through pointers. Three parallel primitive arrays hold the same data in ~8.6 MB
-of contiguous memory, which is what step 6's per-vehicle nearest-segment scan will walk.
-
-## Projecting GPS onto the route
-
-Two buses at `(33.75, -84.39)` and `(33.77, -84.41)` are 2.7 km apart as the crow flies. That
-number is useless — buses follow streets, and the route between them might be 2.8 km or 9 km
-depending on how it winds. `ShapeProjector` snaps each GPS point onto the route's polyline and
-returns **how far along the route it is**, turning two coordinates into two positions on a line.
-On a line, the gap between two buses is a subtraction.
-
-```bash
-.\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests "-Dexec.mainClass=dev.headway.ingest.HeadwayPreviewMain"
-```
-
-### Why not planar geometry on degrees
-
-At Atlanta's latitude one degree of longitude is ~92.6 km while one degree of latitude is
-~111.3 km. Treating them as equal stretches every east-west distance by 20% and picks the wrong
-segment near diagonal corners. Each segment is instead converted into a local east-north plane in
-metres, centred on the query point:
-
-```
-x = (lon - queryLon) * 111195.08 * cos(queryLat)
-y = (lat - queryLat) * 111195.08
-```
-
-That is the equirectangular approximation — sub-metre accurate over the tens of km a route spans,
-and two multiplications instead of trigonometry per segment. Centring on the query point also puts
-it at the origin, which simplifies the point-to-segment maths.
-
-Distance along the route interpolates the feed's own `shape_dist_traveled` rather than summing
-computed segment lengths, so projection error never accumulates along the route.
-
-### Validated against 359,676 real shape points
-
-Projecting a shape's own vertices back onto that shape must return each vertex's own distance:
-
-```
-9093 vertices across 215 shapes in 498ms (18259 projections/sec)
-worst cross-track error   : 0.0000 m   <- the geometry itself
-worst along-route error   : 13458.3 m (shape 136624)
-vertices with >50 m along-route error: 19 of 9093 (0.21%), across 16 shapes
-  still wrong when given a previous-position hint: 4
-```
-
-**Cross-track error is exactly zero** — the geometry is right. The 13.4 km along-route error with
-*zero* cross-track is not a bug: shape 136624 passes through that identical coordinate twice. The
-question "where on the route is this?" genuinely has two answers.
-
-### The loop problem, and the fix
-
-A route that loops or doubles back along one street has two segments near-equally close to any
-point on the doubled section. GPS jitter of a few metres flips which one wins, and the bus appears
-to teleport kilometres between polls.
-
-`projectNear(shape, lat, lon, hintMetres, windowMetres)` searches only the stretch near the
-vehicle's *previous* position. A bus that was at 8,000 m fifteen seconds ago is still within a few
-hundred metres of that, so the far-away duplicate is excluded outright. It is also faster — a
-binary search over the sorted cumulative distances, then a scan of a fraction of the polyline.
-
-Measured effect: **19 ambiguous vertices → 4**. The residue is tight doublings-back where both
-candidates fall inside the plausible-movement window. Affected shapes are 16 of 215 (7%), and
-affected positions 0.21%.
-
-### Live GPS quality
-
-```
-164 vehicles projected in 11.3ms (69us per vehicle)
-cross-track: median 5.1 m | p90 15.6 m | p99 2832.5 m | max 5443.6 m
-8 of 164 vehicles are more than 100 m off route
-```
-
-Median 5 m and p90 16 m means real fixes land essentially on the shape. The handful of multi-km
-outliers are buses assigned to a trip they have not started — deadheading to the route's start.
-`ShapeProjection.isOnRoute(maxCrossTrackMetres)` exists for exactly this; step 7 should discard
-projections beyond roughly 150 m rather than compute headways from them.
-
-### Accuracy: checked against something that shares no code
-
-Self-consistency proves the geometry is internally correct, but not that the numbers mean anything
-about the real world — a projector using the wrong distance units would still pass it. So
-`ProjectionAccuracyMain` compares two independent measurements:
-
-- **Implied speed** — the change in *our* computed distance-along-route between two sightings,
-  divided by elapsed time. Entirely our geometry and the shape file.
-- **Reported speed** — what the bus's own equipment put in the feed. Never touched by our code.
-
-```bash
-.\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests "-Dexec.mainClass=dev.headway.ingest.ProjectionAccuracyMain"
-```
-
-Two samples 75 seconds apart, 154 vehicles tracked across both:
-
-```
-implied speed over 35 m/s (physically absurd)  : 0 (0.0%)
-appeared to move backwards by more than 20 m   : 4 (2.6%)
-implied speed: median 5.30 m/s | p90 13.56 m/s | max 21.43 m/s
-
-mean implied speed  (our projection)   : 9.12 m/s
-mean reported speed (vehicle hardware) : 9.43 m/s
-correlation                            : 0.80
-absolute difference: median 2.05 m/s | p90 4.62 m/s
-```
-
-The two means agree to **3.3%**, with zero physically impossible speeds. A projector reading
-kilometres as metres, or picking wrong segments, would fail this immediately and obviously.
-
-**How to read the 2.05 m/s median difference.** MARTA quantizes reported speed to exact 5 mph
-buckets — the only values in the feed are 0.44704, 2.2352, 4.4704, 6.7056, 8.9408, 11.176,
-13.4112, 15.6464, 17.8816, 22.352 and 26.8224 m/s, which are 1, 5, 10 … 60 mph exactly. The
-reference measurement therefore carries ±1.12 m/s of quantization error before our code is
-involved, and about 43% of vehicles report no speed at all. The projection's real error is smaller
-than the number above; the comparison can only bound it.
-
-**The 2.6% that appear to move backwards** are the honest residue — loop ambiguity and shape
-mismatches. They show up as one bad sample rather than persistent drift, so step 7's windowing
-should absorb them, but they are real and not yet zero.
-
-### Actual gaps, right now
-
-```
-group 121:1 — 4 buses on a 28.8 km shape
-   4625 at  6171.3 m
-   3670 at  9106.2 m   gap  2934.9 m
-   5117 at 24686.0 m   gap 15579.8 m
-   4605 at 28680.3 m   gap  3994.3 m
-
-tightest gaps anywhere in the system:
-    19.0 m apart on group 140:1
-    92.7 m apart on group 89:0
-```
-
-Two buses **19 metres apart** on route 140. That is bunching, live, detected end to end — and it is
-what step 7 turns into an alert.
-
-### Caching: `refreshAfterWrite` vs `expireAfterWrite`
-
-The zip is cached on disk and re-fetched with a **conditional GET** — `If-Modified-Since` against
-MARTA's `Last-Modified`. A `304` costs a few hundred bytes instead of 21 MB, and unlike a
-once-a-day timer it stays correct whether the agency publishes twice in a day or not at all for a
-month.
-
-In memory it sits in a single-entry Guava `LoadingCache`, with **both** deadlines set:
-
-- **`expireAfterWrite(24h)`** invalidates the entry, so the next caller *blocks* while it reloads —
-  here that means a 21 MB download plus a 360,000-point parse, seconds of stall.
-- **`refreshAfterWrite(6h)`** keeps serving the existing snapshot and reloads in the background.
-  Nobody blocks; one thread does the work.
-
-Refresh at 6h is the normal path; expire at 24h is the backstop so repeated refresh failures
-eventually surface instead of serving a week-old schedule forever.
-
-One subtlety: Guava's default `CacheLoader.reload()` is **synchronous** — it just calls `load()` on
-the triggering thread, so plain `refreshAfterWrite` still blocks somebody. Making it genuinely
-async requires overriding `reload()` to return a `ListenableFuture`, which
-`GtfsStaticRepository` does. A failed refresh returns the previous snapshot rather than throwing,
-so a MARTA outage degrades to "slightly stale", never to "no schedule".
-
-## Concurrency notes
-
-The interesting parts, and where to read them:
-
-| Concern | Where | Approach |
-|---------|-------|----------|
-| Shared mutable state | [`VehicleStore`](headway-ingest/src/main/java/dev/headway/ingest/VehicleStore.java) | `ConcurrentHashMap.compute` — read-decide-write as one atomic step, avoiding a check-then-act race |
-| Cost of that atomicity | `VehicleStore.apply` | A lock-free `get` that can only prove staleness runs first; `compute` still decides. 7.5× on the path carrying half the traffic |
-| Idempotency / late data | `VehiclePosition.isSupersededBy` | Per-vehicle last-seen timestamp; older readings dropped |
-| Consistent reads | `VehicleStore.snapshot()` | Guava `ImmutableMap` copy, so readers never see a half-applied batch |
-| Contended counters | `VehicleStore` | `LongAdder`, not `AtomicLong` |
-| Unbounded growth | `VehicleStore.evictStale` | Vehicles silent for 10 minutes are swept |
-| Admission / eviction agreement | `VehicleStore.isAdmissible` | One `maxAge` governs both, so a reading can never be accepted and then immediately swept |
-| Politeness to MARTA | [`FeedPoller`](headway-ingest/src/main/java/dev/headway/ingest/FeedPoller.java) | Guava `RateLimiter` as a hard ceiling, independent of the scheduler's cadence |
-| Scheduler survival | `FeedPoller.run()` | Catches `Throwable`; an escaping exception silently cancels a `scheduleWithFixedDelay` task forever |
-| Overload behaviour | [`IngestService`](headway-ingest/src/main/java/dev/headway/ingest/IngestService.java) | `scheduleWithFixedDelay`, not `AtFixedRate`, so slow responses never cause a thundering catch-up |
-| Clean shutdown | `IngestService.close()` | Ordered: scheduler → fetches → workers (draining) → Kafka flush |
-| Memory safety under load | [`ShardedPositionQueue`](headway-ingest/src/main/java/dev/headway/ingest/pipeline/ShardedPositionQueue.java) | Bounded `ArrayBlockingQueue`; `put()` blocks instead of growing |
-| Ordering vs. parallelism | `ShardedPositionQueue.shardFor` | Route hashed to a shard, one worker per shard — parallel across routes, ordered within one |
-| Negative hash indexes | `ShardedPositionQueue.shardFor` | `Math.floorMod`, not `%` or `Math.abs` — `abs(Integer.MIN_VALUE)` is still negative |
-| Cheap blocking I/O | [`IngestService`](headway-ingest/src/main/java/dev/headway/ingest/IngestService.java) | Virtual threads for fetches, platform threads for CPU-bound workers |
-| Observability | [`IngestMetrics`](headway-ingest/src/main/java/dev/headway/ingest/pipeline/IngestMetrics.java) | Micrometer; queue depth and blocked time make backpressure visible |
-
-The concurrency test in `VehicleStoreTest` is not decorative: the same workload run against a
-naive `get()`-then-`put()` implementation served a stale position on 5 of 40 runs.
-
-Every claim in that table is measured in [The benchmarks](#the-benchmarks-step-11).
-
-## The Spark streaming job
-
-```
-Kafka vehicle-positions
-     |  parse JSON against a declared schema
-     v
-project onto the route shape        (broadcast GTFS + step 6's projector)
-     |  drop anything >150 m off route
-     v
-watermark 2 min, window 60s / slide 30s, group by route:direction
-     |  newest reading per vehicle, order by distance, difference neighbours
-     v
-console  +  Kafka route-headways
-```
-
-Build the submit jar, then run it (Kafka must already be up):
-
-```bash
-.\mvnw.cmd -q -pl headway-stream -am package -DskipTests
-```
-
-```bash
-docker compose --profile stream up spark
-```
-
-### Why Spark runs in Docker and not on the host
-
-Not a preference — a requirement on Windows. Structured Streaming **checkpointing** goes through
-Hadoop's filesystem layer, which calls native `winutils.exe` / `hadoop.dll` that Windows does not
-ship:
-
-```
-java.io.FileNotFoundException: HADOOP_HOME and hadoop.home.dir are unset
-```
-
-Batch Spark works fine on Windows — a `spark.range(1,11).count()` smoke test passed on Java 21
-with no flags at all — which is exactly why this only appears once you add a checkpoint. The usual
-workaround is downloading unofficial `winutils` binaries; running the official `apache/spark` image
-is cleaner, reproducible, and the reason the broker advertises two listeners.
-
-The container reaches Kafka at **`kafka:29092`** (the `DOCKER` listener), while the ingest service
-on the host uses `localhost:9092`. That two-listener config from step 3 is what makes both work at
-once.
-
-### Watermarking
-
-A window covering 10:00:00–10:01:00 cannot be closed the moment the clock passes 10:01 — a
-vehicle's 10:00:58 reading may arrive at 10:01:04. But Spark cannot wait forever either, or state
-grows without bound. `withWatermark("ts", "2 minutes")` says: once an event stamped 10:03 arrives,
-consider every window ending before 10:01 closed and drop its state.
-
-Two minutes is chosen from measured behaviour, not taste: MARTA republishes every ~30 s, vehicle
-timestamps trail the feed timestamp by up to ~2 minutes, and step 5's audit found one bus 708 s
-stale. Too low and real data is silently dropped; too high and memory grows and results lag. It is
-a completeness-against-latency dial.
-
-**Sliding, not tumbling.** 60 s windows every 30 s means each instant is covered twice, so a
-bunching event straddling a boundary cannot be split and missed by both windows.
-
-### Details worth knowing
-
-| Decision | Reason |
-|---|---|
-| Declared JSON schema | Inferring a schema from a stream samples whatever arrives first, and can differ between restarts — which invalidates the checkpoint |
-| Broadcast the GTFS snapshot | 8.6 MB of shapes; a captured reference would serialise a copy into *every task*. Broadcast ships it once per executor |
-| One `foreachBatch`, not two `writeStream`s | Two queries read the source topic twice; and `orderBy` needs `Complete` mode, which retains every window forever and defeats the watermark. A batch DataFrame sorts freely |
-| `batch.persist()` inside `foreachBatch` | The batch is consumed twice (show + Kafka write); without it Spark reruns the whole aggregation, projection UDF included |
-| `spark.sql.shuffle.partitions=8` | The default 200 means 200 near-empty tasks per batch for ~65 groups — the most common local-Spark slowdown |
-| Dedupe to newest-per-vehicle | A 60 s window at 15 s polling holds ~4 sightings of the same bus; without deduping you measure the gap between a bus and itself and report constant bunching |
-| `provided` Spark, shaded Kafka connector | The image supplies Spark; the Kafka connector is not in it. Excluding Hadoop and Scala from the shade took the jar from 72 MB to 18.8 MB |
-
-### It works
-
-```
-=== batch 5: 134 route-direction groups with 2+ buses ===
-|windowEnd          |headwayGroup|routeLongName        |vehicleCount|minGapMetres|maxGapMetres|
-|2026-08-15 02:30:30|95:1        |Metropolitan Parkway |2           |25.6        |25.6        |
-|2026-08-15 02:30:00|89:0        |Old National Highway |4           |38.1        |10095.3     |
-|2026-08-15 02:30:30|1:1         |Joseph E. Lowery Blvd|3           |1804.6      |4585.8      |
-```
-
-269 records landed on `route-headways`, each carrying the ordered vehicles and distances so an
-alert can name *which* two buses are too close:
-
-```json
-{"headwayGroup":"83:1","routeLongName":"Campbellton Road","vehicleCount":2,
- "minGapMetres":4216.7,"orderedVehicles":["3541","3531"],
- "orderedDistancesMetres":[79.5,4296.2]}
-```
-
-Only batch 0 fell behind the 30 s trigger (36 s — JIT warmup plus broadcasting the shapes);
-batches 1–5 kept up.
-
-### Tests
-
-The headway arithmetic — deduplicate, order, difference — lives in `HeadwayGaps`, a plain Java
-class with no Spark in it. That separation is the point: a bug there silently produces wrong
-headways, and leaving it inside a UDF would mean the only way to test it was to stand up a
-`SparkSession`, which is slow enough that in practice it does not get tested at all.
-
-- **`HeadwayGapsTest`** — 20 tests, 0.3 s, no Spark. The load-bearing one is
-  `oneBusIsNotAConvoy`: four sightings of a single bus in one window must produce **zero** gaps.
-  Skip the dedupe and you measure the distance between a bus and itself moments earlier, and every
-  route reports severe bunching forever.
-- **`HeadwayFunctionsSparkTest`** — 6 tests through a real DataFrame, covering what the pure tests
-  cannot: Catalyst `Row` conversion, broadcasting the schedule, the declared JSON schema against a
-  message copied from the live topic, and the sharp edge where an array column arrives as a
-  `scala.collection.Seq` rather than a `List` (a runtime `ClassCastException`, never a compile
-  error). Batch, not streaming, since checkpointing is exactly what does not work on Windows.
-
-These caught a real latent bug immediately: pinning `scala-library` to 2.13.16 when Spark 4.1.3 is
-built against 2.13.17 throws `NoSuchMethodError: MurmurHash3$.caseClassHash` the moment a
-`SparkSession` is created. Scala's standard library is not binary compatible across patch releases
-in the way the version number suggests.
-
-## Bunching detection
-
-A 400 m gap between two buses means nothing on its own. On a route running every 4 minutes it is
-severe bunching; on one running every 45 it is unremarkable. **Only the ratio of observed to
-scheduled headway is interpretable**, so the schedule has to be reconstructed first.
-
-### Reconstructing the timetable
-
-MARTA publishes no `frequencies.txt`, so scheduled headway comes from `stop_times.txt` — 2,415,219
-rows, 126 MB, the largest file in the feed. All that is needed from it is, per trip, the departure
-from the first stop and the arrival at the last: two rows out of the forty-odd each trip
-contributes. It is streamed and reduced on the fly, tracking the lowest and highest `stop_sequence`
-per trip, so peak memory is one small array per trip rather than 2.4 million parsed rows.
-
-```
-Calendar: 19 weekly services, 4 dates with additions, 4 with removals
-Schedule: read 2415218 stop_times rows in 4893ms -> 52401 trips across 169 route:direction groups (0 skipped)
-Loaded static GTFS in 6540ms
-```
-
-Then for a route, direction and moment: take trips whose service runs today, keep those departing
-within ±45 minutes, and take the **median** gap between consecutive departures. Median because a
-mid-morning break between peaks would otherwise drag the "typical" headway well above what riders
-actually experience.
-
-Average speed comes from the timetable too — shape length over scheduled running time — which
-already includes every stop and dwell. That converts a scheduled headway in minutes into an
-expected **spacing in metres**, directly comparable to what the projection produces.
-
-### Two GTFS traps this had to handle
-
-**Times past midnight.** 88,862 rows have an hour of 24 or more, up to 26 — after-midnight services
-belonging to the *previous* operating day. `LocalTime.parse("25:30:00")` throws, so times are
-parsed by hand into seconds since the start of the service day. MARTA also writes `" 6:20:00"`
-with a leading space and no zero padding.
-
-**Service calendars.** The feed holds every kind of day at once: weekday, Saturday, Sunday and
-holiday trips all sit in the same `trips.txt`, separated only by `service_id`. `calendar.txt` gives
-the weekly pattern (service 5 = Mon–Fri, 3 = Saturday, 4 = Sunday) and `calendar_dates.txt`
-overrides it — on 2026-07-04 service 29 is added and service 3 removed. Skip the filtering and a
-Friday rush hour averages with a Sunday morning, halving the apparent headway and making a
-perfectly spaced fleet look bunched.
-
-### Classification
-
-| Ratio | Status |
-|---|---|
-| ≤ 0.25 | `SEVERE_BUNCHING` |
-| ≤ 0.50 | `BUNCHING` |
-| 0.50 – 1.50 | `ON_SCHEDULE` |
-| ≥ 1.50 | `GAPPING` |
-| ≥ 2.50 | `SEVERE_GAPPING` |
-| — | `LAYOVER` (parked at a terminal) |
-
-Only the four abnormal statuses reach `headway-alerts`. `ON_SCHEDULE` and `LAYOVER` are the large
-majority, and an alert feed that includes them is one nobody reads.
-
-### The layover filter
-
-Step 7 found route 89 reporting a 38.1 m gap in every window — two buses parked at a terminal, not
-bunched. A vehicle is now excluded when it is **stationary *and* near an endpoint**. Both
-conditions are required, and that is the point: stationary anywhere would exclude buses stuck at a
-red light or dwelling at a busy stop, which are exactly the conditions that *cause* bunching.
-Movement is measured across all of a vehicle's sightings before deduplication, since collapsing to
-the newest reading first would throw away the only evidence it moved.
-
-### Live results
-
-```
-=== batch 2: 50 route-direction groups with 2+ buses ===
-    11 alerts
-|headwayGroup|routeLongName                 |status         |gap_m |expected_m|ratio|sched_min|buses       |
-|140:1       |North Point Parkway           |SEVERE_BUNCHING|17.0  |8910.0    |0.00 |20.0     |[3687, 3681]|
-|10:1        |AUC / Hollywood Road          |SEVERE_BUNCHING|2713.0|12503.0   |0.22 |30.0     |[4663, 4671]|
-|51:1        |Joseph E. Boone / Ralph McGill|SEVERE_BUNCHING|1973.0|8579.0    |0.23 |20.0     |[4669, 4651]|
-|71:0        |Cascade Road                  |BUNCHING       |3295.0|10290.0   |0.32 |20.0     |[4658, 4636]|
-```
-
-Two buses **17 metres apart** on a route scheduled every 20 minutes. And route 89 now reports a real
-4,262 m gap instead of the 38.1 m phantom — the layover filter working.
-
-11 alerts from 50 groups: the filter discriminates rather than firing on everything. A full alert
-names the pair, so it is actionable rather than merely true:
-
-```json
-{"headwayGroup":"71:0","routeLongName":"Cascade Road","status":"BUNCHING",
- "scheduledHeadwaySeconds":1200,"expectedSpacingMetres":10289.9,"averageSpeedMps":8.57,
- "minGapMetres":3442.0,"observedHeadwaySeconds":401.4,"headwayRatio":0.334,
- "orderedVehicles":["4658","4636","4643"],"worstPairVehicles":["4658","4636"],
- "orderedDistancesMetres":[4554.4,7996.4,11798.7]}
-```
-
-*Buses 4658 and 4636 on Cascade Road are 6.7 minutes apart. They should be 20.*
-
-### A bug the tests caught
-
-`ScheduleIndex` treated an **empty** set of active services as "don't filter" rather than "nothing
-runs today". On a Saturday that folded every weekday trip back in, roughly halving the apparent
-scheduled headway and reporting a correctly spaced fleet as bunched. Only a genuinely absent
-calendar disables filtering now.
-
-### An honest limitation — closed in step 9
-
-Sliding windows mean the same event appears in two or three overlapping windows, so alerts repeat
-on the topic. That is inherent to the log: records are keyed by `headwayGroup`, and collapsing
-repeats needs a small piece of state that remembers what is already alerting — which a streaming
-aggregation deliberately does not have across windows. Step 9's `AlertTracker` is that state, and
-the topic itself still carries every measurement, which is what makes the dedup auditable.
-
-### The finding that shaped step 8
-
-Route 89 direction 0 reported a 38.1 m gap in every window. Pulling the full record:
-
-```
-89:0  vehicles=[3503, 3694, 3519, 3507]
-      distances: [0.0, 38.1, 10133.4, 13165.8]
-```
-
-Vehicles 3503 and 3694 sat at 0.0 m and 38.1 m, unchanged across three windows spanning 90
-seconds. They were **parked at the terminal**, not bunched — and the exact `0.0` is step 6's
-clamping, meaning 3503 was at or before the route start. Fixed by the layover filter above.
-
-## The API (step 9)
-
-The front door: everything the pipeline computes, served to anything with HTTP.
-
-```bash
-.\mvnw.cmd -pl headway-api -am spring-boot:run
-```
-
-```
-Kafka route-headways ────┐
-                         ├──▶ one consumer thread each ──▶ ConcurrentHashMaps ──┬──▶ REST       (ask)
-Kafka vehicle-positions ─┘                                                      └──▶ WebSocket  (listen)
-```
-
-Nothing in this module computes a headway. Everything it serves was decided by the Spark job; the
-value added is **shape**. A topic is a *log of measurements*; a dashboard needs *current state*.
-Those are different data structures, and turning one into the other is the whole job. Two
-consequences fall out: all state is a projection and can be rebuilt by re-reading the topic, so
-nothing is persisted and a restart costs one batch interval; and repeated measurements of one event
-are a property of the log, not of reality, so collapsing them belongs here.
-
-| Endpoint | Answers |
-|----------|---------|
-| `GET /api/routes` | every route:direction being measured, worst first (`?alertingOnly=true` to filter) |
-| `GET /api/routes/10:1` | one group |
-| `GET /api/alerts` | current problems, as **episodes**, not window records |
-| `GET /api/alerts/history` | recently resolved episodes |
-| `GET /api/vehicles` | last known position of every bus (`?routeId=` to filter) — the map's data |
-| `GET /api/snapshot` | exactly what a WebSocket frame contains, for anything that would rather poll |
-| `GET /api/status` | the counters that distinguish "quiet network" from "broken pipeline" |
-| `ws://…/ws/live` | a full snapshot on connect, then one per second |
-| `GET /` | the live map — see [The map](#the-map-step-10) |
-
-### Episodes: the duplicate-alert fix
-
-The stream job's sliding windows report one three-minute bunching event six or more times. All six
-are correct measurements; all six describe one event. `AlertTracker` collapses them: an episode
-**opens** on the first alertable window for a group, **absorbs** every window that agrees,
-**escalates** if the status worsens, and **closes** on recovery — or is swept closed after three
-minutes of silence, because a route whose buses go out of service never says goodbye.
-
-Measured live: **17 episodes opened, 98 windows absorbed** — those 98 were each a duplicate alert
-in the step 8 output. The tracker also keeps `worstStatus` separately from the current one, because
-"how bad did it get" (triage) and "is it recovering" (monitoring) are different questions; live
-data showed route 89 at `worst=SEVERE_BUNCHING now=BUNCHING` mid-recovery.
-
-### The state itself: same rule, new clock
-
-`LiveHeadwayState` is `VehicleStore` from step 2 with a different clock: apply an update only if it
-is not older than what is held, inside one atomic `compute`. Here the gate is the window end rather
-than the GPS timestamp, and it earns its keep immediately — Spark's Update mode re-emits windows
-when late data refines them, and a live run rejected **252** stale re-emissions that would each
-have made the dashboard jump backwards in time.
-
-### Fan-out: the slow-client problem
-
-One thread serialises each snapshot once and sends the same bytes to every socket. Two guards make
-that safe. Each session is wrapped in Spring's `ConcurrentWebSocketSessionDecorator` — sessions are
-not thread-safe, and interleaved writes splice two frames into a protocol error — with a 512 KB
-buffer cap that **disconnects** a client that falls behind: a client half a megabyte behind is
-looking at a map minutes old, so the connection has already failed; reconnecting costs it one
-second. And ticks flow through a `Conflator` that keeps only the newest pending snapshot — when the
-sender is slow, obsolete frames are never queued at all. Same bounded-buffer argument as step 4, at
-the other end of the pipeline.
-
-### What step 9 broke, in order
-
-- **Spring Boot's BOM in the parent pom killed Spark.** See [Module layout](#module-layout). The
-  BOM now lives in `headway-api/pom.xml` only, with Jackson and Kafka re-pinned *above* the import,
-  because the first matching entry wins.
-- **Split logback.** Pinning only `logback-classic` (1.5.12) let Boot's BOM pick `logback-core`
-  (1.5.18); they share internals and the mismatch was an `AbstractMethodError` on the first log
-  line. Both are now pinned to one property.
-- **`-parameters` was never set.** javac discards method parameter names by default; Spring needs
-  them to bind `@PathVariable`. Boot's starter-parent sets the flag, this build deliberately
-  doesn't inherit it, so every handler 500'd on first request. Now set in the parent's compiler
-  config.
-- **The Spark checkpoint cannot live on a Windows bind mount.** Its commit protocol assumes atomic
-  renames; a bind mount under OneDrive does not honestly provide them. The job died with
-  `CONCURRENT_STREAM_LOG_UPDATE` ("multiple streaming jobs" — there was one) and a state-store
-  validation failure on rows nobody corrupted. The checkpoint now lives inside the container's own
-  filesystem; recreating the container costs one minute of rebuilt windows. See below — this one
-  came with a lesson attached.
-
-### Two changes at once, and how to undo that
-
-The state-store failure looked like a Spark bug. The error arithmetic supported it —
-`bitSetWidthInBytes: 8`, field `offset: 16, size: 224`, but `rowSizeInBytes: 240`, when 8 + 16 +
-224 is 248 — and `collect_list` stores an opaque serialised buffer that a validator could plausibly
-mis-measure. So the validator was disabled *and* the checkpoint was moved off the bind mount, in the
-same edit. The job came up. Nothing was learned.
-
-That is a bad place to stop, because the fix carried a real cost:
-`stateStore.formatValidation.enabled=false` removes the guard that catches a restart against an
-incompatible checkpoint, turning a loud failure into silently wrong output. Paying that for a
-change that may have done nothing is worse than not knowing.
-
-Settled by re-running with the validator **on** and the checkpoint on the container filesystem:
-
-```
-=== batch 0: 0 route-direction groups with 2+ buses ===
-=== batch 1: 58 route-direction groups with 2+ buses ===   <- previously died here
-=== batch 2: 63 ===   === batch 3: 63 ===   === batch 4: 68 ===
-```
-
-Batch 1 is the first batch that reloads state, and it is exactly where the query used to abort.
-Clean through batch 6 with ~60 groups of live state reloaded every time. **The validator was never
-the problem; the bind mount was.** The `formatValidation` line is gone and the diagnosis that
-justified it is recorded in `HeadwayStreamMain` as wrong, because a plausible wrong explanation
-left in a comment is worse than no comment.
-- **`durationSeconds` was missing from the wire.** Jackson auto-detects `getX()` accessors and
-  record components; a method named `durationSeconds()` is neither. Found by reading live output —
-  the round-trip test recomputed the value after parsing and never noticed. The test now asserts
-  against the raw JSON.
-
-### It works
-
-Live run, 2026-08-15, with ingest, Kafka, Spark and the API all up:
-
-```
-GET /api/status   routes: 39   vehicles: 177   openAlerts: 15
-                  headwayRecords: 559   staleRecords: 252   malformedRecords: 0
-                  alertsOpened: 17   alertsAbsorbed: 98   alertsCleared: 3
-
-GET /api/alerts   17 open episodes, worst first:
- 165:0  Fairburn Road / Camp Creek   worst=SEVERE_BUNCHING  ratio=0.04  dur=150s  windows=8
-  89:1  Old National Highway         worst=SEVERE_BUNCHING  ratio=0.02  dur=120s  windows=7
-  15:1  Clifton Road / Candler Road  worst=SEVERE_GAPPING   ratio=2.98  dur=120s  windows=6
-```
-
-WebSocket verified from a real browser: full snapshot on connect, then one ~84 KB frame per second
-— 48 routes, 20 episodes, 179 buses per frame.
-
-## The map (step 10)
-
-Open **<http://localhost:8080/>** with the stack running. Three static files served off the
-classpath by the same Spring Boot app — no build step, no bundler, no framework.
-
-Buses are coloured by the verdict for their route and direction; the two named in an alert get a
-white ring. The panel lists **events, not measurements** — the same collapse `AlertTracker` does,
-made visible: a row reading `20 windows` is twenty overlapping window measurements behind one line.
-Clicking a row frames the two buses involved. Clicking a bus explains it.
-
-### Deriving a bus's colour, backwards
-
-A vehicle position has a `routeId` but no usable direction — MARTA's `directionId` is not the GTFS
-0/1 flag — so a bus cannot say which headway group it belongs to. The mapping only runs one way:
-each route record already lists the vehicles it measured, in order, so inverting
-`orderedVehicles` gives every bus its group's verdict without guessing. Buses in no measured group
-stay grey, which is honest: "not currently being compared to anything" is not the same as "fine".
-
-### The two things that actually matter in the client
-
-**Reuse markers, never recreate them.** 180 buses at one frame a second is 10,800 objects a minute
-if each frame rebuilds the layer. Markers live in a `Map` keyed by vehicle id and move with
-`setLatLng`; only buses that left the feed are removed. Rebuilding would also slam shut any popup
-mid-read. Same reasoning for the alert list, which is rebuilt only when a signature of its visible
-fields changes — an episode quietly absorbing another window is exactly the case that should *not*
-disturb the display.
-
-**Back off when reconnecting.** The server going down is precisely when every open tab tries to
-reconnect. Retrying in a tight loop turns one restart into a stampede against a process that is
-still starting. Exponential backoff to 15s, and a watchdog that reports `stale` if frames stop
-arriving for five seconds — a TCP connection can be dead while still looking open, and a green
-light over a frozen map is a lie.
-
-### A bug the hidden pane exposed
-
-The first automated check reported a correctly sized 1100×844 map container with a **0×0 Leaflet
-canvas**. Not a rendering bug in the page — `document.hidden` was true and zero animation frames
-fired in half a second, so Leaflet's deferred sizing never ran.
-
-That is an artifact of the test environment, but it points at a real defect: Leaflet measures its
-container once and afterwards only on a *window* resize. Load this page in a background tab and the
-same suspension applies; switching to the tab fires no resize event, so nothing corrects it and the
-map stays empty. Collapsing the alert panel changes the map's width without changing the window's
-at all. A `ResizeObserver` on the element plus a `visibilitychange` handler covers both — the fix
-for the most common Leaflet complaint there is, *"the map is blank until I resize the window"*.
-
-> **Editing the static files while `spring-boot:run` is up does nothing.** They are served from
-> `target/classes`, which is populated at build time. Restart the app (or re-run `package`) after
-> changing `index.html`, `app.js` or `style.css`. Hard-reloading the browser will not help — the
-> server is genuinely still serving the old bytes.
-
-### Leaflet is pinned and hash-checked
-
-`leaflet@1.9.4` with a Subresource Integrity hash on both the CSS and the JS. Version-pinning alone
-is not enough — `leaflet@1` would silently take a new minor — and an SRI hash makes the browser
-refuse a file whose bytes changed at all. The hashes were computed from the downloaded files rather
-than copied from somewhere, which is the only way an integrity hash means anything. Tiles come from
-CARTO's free dark basemap over OpenStreetMap data, attributed in the corner.
-
-### It works
-
-Verified against the live feed in a real browser: 177 buses, 45 route-directions, 9–11 alerts,
-socket `live`. Route 83 was watched through a full episode — it opened at `severe bunching`, was
-absorbed across 20 windows, and appeared as `severe bunching → bunching` while recovering. When it
-cleared, the row disappeared and both buses turned green. Clicking bus 3621 a minute later:
+## What you see
+
+A dark map of Atlanta with every bus on it, updating once a second.
+
+- Each dot is a bus, coloured by how well spaced it is: **green** is fine, **orange** and **red**
+  mean bunched, **blue** and **purple** mean a hole has opened up, **grey** means we cannot say.
+- The two buses in an actual bunching incident get a **white ring**, so you see the specific pair,
+  not just a troubled route.
+- The side panel lists what is going wrong right now, worst first — *"route 83 Campbellton Road,
+  severe bunching, 4 minutes so far, buses 3621 and 5104"* — and clicking a row flies the map to
+  those two buses.
+- Clicking a bus explains it in plain terms: which route, how it is doing, how far it is from the
+  bus in front, and how far it *should* be.
+
+Real example, captured live:
 
 ```
 Bus 3621
@@ -996,201 +65,624 @@ Closest gap   3.5 km of 6.2 km
 Seen          28s ago
 ```
 
-That is the same bus, the whole pipeline, and the entire point of the project in one popup.
+That same bus had been flagged as severely bunched four minutes earlier. You can watch problems
+appear, get worse, and recover.
 
-## The benchmarks (step 11)
+---
+
+## How it works, start to finish
+
+Six stages. Here is the whole thing in plain English first; the details come later.
+
+```
+   MARTA's live feed                    every 15 seconds, ~175 buses
+          |
+          v
+   1. Ingest          read it, throw away the repeats, hand it on
+          |
+          v
+   2. Kafka           a durable queue, so nothing is lost if a stage restarts
+          |
+          v
+   3. Spark           group buses by route, measure the gaps between them
+          |
+          v
+   4. Compare         is that gap normal for this route at this time of day?
+          |
+          v
+   5. API             keep the current picture in memory, serve it
+          |
+          v
+   6. Map             draw it in a browser
+```
+
+**1. Get the data in.** MARTA publishes where every bus is, as a file that updates roughly every 30
+seconds. Headway asks for it every 15 seconds. Half those requests return a file it has already
+seen, which is fine and expected — asking more often than the data changes is the only way to get
+it promptly, and duplicates are recognised and dropped.
+
+**2. Put it on a queue.** Kafka is a durable log: things get written to it, and readers work through
+them at their own pace. It means the part that reads MARTA and the part that does the maths do not
+have to run at the same speed, or even at the same time.
+
+**3. Measure the gaps.** This is the hard part, and it is not "how far apart are these two dots".
+Two buses 2 km apart in a straight line might be 2 km apart along the road, or 9 km, depending on
+how the route winds between them. So each bus's GPS position is snapped onto the route's actual
+path and converted into *how far along the route it is*. Once every bus is a single number on a
+line, the gap between two buses is just a subtraction.
+
+**4. Decide if it is a problem.** A 400 m gap means nothing by itself. On a route running every 4
+minutes it is severe bunching; on one running every 45 minutes it is completely normal. So the
+observed gap is compared against what the timetable implies it should be, and the **ratio** is what
+gets classified.
+
+**5. Keep the current picture.** A queue is a *history* of measurements. A dashboard needs *the
+state right now*. Converting one into the other is a real job, and it is what the API does: it
+reads the stream and keeps one up-to-date answer per route in memory.
+
+**6. Draw it.** The browser holds one open connection and receives the complete picture once per
+second.
+
+---
+
+## Try it yourself
+
+You need **Java 21** and **Docker Desktop running**. Nothing else — the build tool downloads
+itself.
+
+> Java 21 specifically, not 25. Spark does not support 25 yet.
+
+**Build it** (this also runs all 202 tests, and takes a few minutes the first time):
 
 ```bash
-.\mvnw.cmd -q -pl headway-bench -am package -DskipTests
+.\mvnw.cmd clean package
 ```
+
+**Start the queue:**
+
+```bash
+docker compose up -d
+```
+
+Wait about 20 seconds, until `docker compose ps` says `healthy`.
+
+**Start reading MARTA** — leave this running in its own terminal:
+
+```bash
+.\mvnw.cmd -q -pl headway-ingest -am package exec:java -DskipTests
+```
+
+**Start the maths** — another terminal:
+
+```bash
+docker compose --profile stream up spark
+```
+
+**Start the website** — another terminal:
+
+```bash
+java -jar headway-api/target/headway-api-0.1.0-SNAPSHOT.jar
+```
+
+**Open <http://localhost:8080/>**
+
+Give it about 90 seconds. The first minute is genuinely empty — the system needs to see each bus
+twice before it can measure anything.
+
+**To stop everything:**
+
+```bash
+docker compose --profile stream down
+```
+
+Then Ctrl+C the other two terminals. On Windows, Ctrl+C does not always kill the Java process
+underneath, and a survivor will block your next build:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -like "*headway*" } | Stop-Process -Force
+```
+
+### Is it working?
+
+```bash
+curl -s http://localhost:8080/api/status
+```
+
+`routes` above zero means the whole chain is alive. If `malformedRecords` is climbing, two parts of
+the system disagree about the data format — which otherwise looks identical to "no data".
+
+Running it at 3 AM will show almost no buses. That is Atlanta being asleep, not a bug.
+
+---
+
+## The pieces, explained
+
+### Reading the feed
+
+MARTA publishes in **GTFS-Realtime**, the standard format transit agencies use. It arrives as
+Protocol Buffers — a compact binary format, not human-readable, roughly 13 KB for the whole fleet.
+
+The interesting problem here is **duplicates**. Every other poll returns a byte-identical file:
+
+```
+poll: 186 received | 186 new,   0 updated,   0 stale | 186 vehicles on 65 routes
+poll: 186 received |   0 new, 180 updated,   6 stale | 186 vehicles on 65 routes
+poll: 186 received |   0 new,   0 updated, 186 stale | 186 vehicles on 65 routes
+```
+
+Every reading carries a timestamp, and a reading is only stored if it is **newer** than the one
+already held for that bus. Everything else is dropped. This sounds minor and it is load-bearing: it
+means re-delivering the same message a hundred times leaves the system in exactly the state one
+delivery would. That property is what makes it safe to replay the entire queue from the beginning
+after a restart.
+
+**A bug worth describing.** A bus whose GPS transmitter freezes keeps appearing in the feed forever
+with the same unchanging timestamp. An early version admitted it (the id was new, so it looked
+new), then the cleanup sweep removed it a minute later for being too old, then the next poll added
+it again — forever, once a minute. Admission and eviction disagreed about what "too old" meant. Now
+one single setting governs both, so the rule holds by construction: *nothing can be let in that the
+next sweep would immediately throw out.*
+
+Readings dated more than two minutes in the **future** are also refused. A bus with a wrong clock
+would otherwise be permanently stuck: nothing would ever look newer than it, so it could never be
+updated, and it would never age out.
+
+### The queue, and why the key matters
+
+Records go into Kafka keyed by **route**. That one choice is worth explaining, because the obvious
+alternative is subtly wrong.
+
+Kafka splits a topic into partitions and only guarantees ordering *within* a partition. Records
+sharing a key always land in the same partition. Key by **bus id** and the load spreads out
+beautifully — and route 15's buses scatter across six partitions, so a reader can process one bus's
+10:00:30 reading before another bus's 10:00:15 reading, and compute a gap from two moments that
+never coexisted.
+
+Key by **route** and every bus on route 15 stays in one partition, in order. Verified on the
+running system: 547 records across 65 routes, spread over all 6 partitions, with **zero routes
+split across more than one partition**.
+
+> **The key follows the question you intend to ask, not the load you want to balance.**
+
+### Keeping the pipeline from eating memory
+
+Between reading the feed and writing to Kafka there is a queue with a **hard size limit**. When it
+fills, the producer *blocks* — reading stops until the writers catch up.
+
+That sounds like a flaw and it is the entire point. An unbounded queue does not remove a
+bottleneck, it hides one: if consumers are slower than producers it grows until memory runs out,
+and the failure is the worst kind — minutes of slow degradation, then a crash whose stack trace
+does not mention the actual cause. A bounded queue turns that into something harmless. Memory stays
+flat and the system runs at the speed of its slowest stage, which is the fastest it could correctly
+go anyway.
+
+This is **backpressure**: slowness travelling upstream as a signal instead of piling up as garbage.
+
+You can watch it work by shrinking the queue to 16 slots and feeding it 176-position batches:
+
+```
+poll: 176 positions enqueued in 914ms (400ms BLOCKED on a full queue) | queue 0/16
+metrics | fetched 702 -> enqueued 702 -> processed 702 | blocked 434ms total | kafka 702 sent / 0 failed
+```
+
+**702 in, 702 out**, with a queue eleven times too small to hold a single batch. Nothing dropped.
+The producer just waited.
+
+The queue is actually split into four, with a route always going to the same one and each one
+drained by exactly one worker. One shared queue with four workers would be faster and would break
+the ordering that keying by route exists to protect — two workers could grab consecutive route-15
+readings and write them to Kafka in either order.
+
+### The timetable
+
+To know whether a gap is bad, you need to know what it should be. MARTA does not publish a
+"buses every N minutes" file, so the timetable has to be reconstructed from `stop_times.txt` —
+**2,415,219 rows, 126 MB**, the biggest file in the download.
+
+All that is needed is, per trip, the first departure and the last arrival: two rows out of the
+forty-odd each trip contributes. So the file is streamed and reduced as it is read, never held in
+memory:
+
+```
+Schedule: read 2415218 stop_times rows in 4893ms -> 52401 trips across 169 groups (0 skipped)
+```
+
+Scheduled headway is the **median** gap between departures around the current time — median rather
+than average, because one mid-morning break between rush hours would drag the average well above
+what riders actually experience.
+
+**Two traps this format sets:**
+
+*Times after midnight.* 88,862 rows have an hour of 24 or more, up to 26 — late-night services that
+belong to the *previous* day. Java's standard time parser throws an exception on `25:30:00`, so
+these are parsed by hand.
+
+*Every kind of day at once.* Weekday, Saturday, Sunday and holiday trips all live in the same file,
+separated only by a service id. Skip that filter and a Friday rush hour gets averaged with a Sunday
+morning — halving the apparent scheduled headway and making a perfectly spaced fleet look bunched.
+
+### Turning GPS into "how far along the route"
+
+Two buses at opposite ends of a horseshoe-shaped route can be 500 m apart in a straight line and
+12 km apart along the road. Straight-line distance is not just imprecise here, it is meaningless.
+
+So each GPS point is snapped onto the route's drawn path and converted into a single number: metres
+travelled from the start. Then a gap is a subtraction.
+
+Some care is needed. One degree of longitude in Atlanta is about 92.6 km while one degree of
+latitude is about 111.3 km, so treating them as interchangeable stretches every east-west distance
+by 20%. Each segment is converted into a local metres grid centred on the point being measured.
+
+**Checked against the shapes themselves:** projecting all 359,676 points of every route back onto
+their own route should return each point's own distance. Sideways error came out at **exactly
+zero**.
+
+**Then checked against something that shares no code at all.** Self-consistency proves the geometry
+is internally correct, not that it means anything real — code that read kilometres as metres would
+pass that test perfectly. So the speed implied by *our* numbers (change in computed distance ÷
+elapsed time) was compared against the speed the buses' own equipment reports:
+
+```
+mean implied speed  (our projection)   : 9.12 m/s
+mean reported speed (vehicle hardware) : 9.43 m/s
+correlation                            : 0.80
+```
+
+**3.3% apart.** And a detail that turned out to matter: MARTA rounds reported speed to exact 5 mph
+buckets, so the *reference* measurement carries about ±1.12 m/s of error before our code is
+involved. The projection is more accurate than that comparison can show — the comparison can only
+put a ceiling on the error.
+
+**The loop problem.** A route that doubles back along the same street has two points on the path
+that are equally close to a bus driving there. GPS jitter of a few metres flips which one wins, and
+the bus appears to teleport kilometres between updates. The fix is to only search near where the
+bus was fifteen seconds ago. That took ambiguous cases from **19 to 4**.
+
+### Measuring gaps as data flows
+
+Apache Spark does the continuous maths. It reads the queue, groups buses by route and direction,
+and every 30 seconds looks at a 60-second window of readings.
+
+Three things happen inside a window, in an order that matters:
+
+1. **Keep only the newest reading per bus.** A 60-second window at 15-second polling holds about
+   four sightings of the same bus. Skip this and you measure the distance between a bus and
+   *itself* moments earlier — tens of metres — and the system reports severe bunching everywhere,
+   forever. There is a test named after this.
+2. **Sort by position along the route.** Not by bus id, not by arrival order. Position is the only
+   ordering in which "the next bus" means anything.
+3. **Subtract neighbours.** Those differences are the headways.
+
+**Late data.** A reading stamped 10:00:58 might not arrive until 10:01:04, so a window cannot be
+closed the instant the clock passes it. But it cannot stay open forever either, or memory grows
+without bound. Spark's answer is a **watermark**: "once you have seen a reading stamped 10:03, treat
+every window ending before 10:01 as finished." Two minutes, chosen from measured behaviour — the
+feed republishes every ~30 s and vehicle timestamps trail it by up to two minutes. Too short and
+real data is silently discarded; too long and results lag. It is a dial between completeness and
+latency, not a magic number.
+
+### Deciding what counts as bunching
+
+Observed spacing divided by expected spacing:
+
+| Ratio | Verdict |
+|---|---|
+| ≤ 0.25 | severe bunching |
+| ≤ 0.50 | bunching |
+| 0.50 – 1.50 | on schedule |
+| ≥ 1.50 | gapping (a hole is opening) |
+| ≥ 2.50 | severe gapping |
+
+**Parked buses are not bunched.** An early version kept reporting two buses on route 89 as 38 m
+apart. They were sitting at a terminal between runs. A bus is now excluded when it is **stationary
+AND near an end of the route** — both conditions, and that is deliberate: "stationary anywhere"
+would exclude buses at red lights and busy stops, which are exactly the conditions that *cause*
+bunching.
+
+Live output:
+
+```
+=== 50 route-direction groups with 2+ buses ===   11 alerts
+|140:1 |North Point Parkway   |SEVERE_BUNCHING| 17 m  | 8910 m expected |0.00| every 20 min |[3687, 3681]|
+|10:1  |AUC / Hollywood Road  |SEVERE_BUNCHING|2713 m |12503 m expected |0.22| every 30 min |[4663, 4671]|
+|71:0  |Cascade Road          |BUNCHING       |3295 m |10290 m expected |0.32| every 20 min |[4658, 4636]|
+```
+
+Two buses **17 metres apart** on a route scheduled every 20 minutes. And 11 alerts out of 50 groups
+— it discriminates rather than firing on everything, which is the difference between a useful alert
+feed and one nobody reads.
+
+### The API, and one event instead of twenty
+
+Sliding windows mean the same three-minute bunching incident gets measured six or more times. Every
+one of those measurements is correct. All of them describe **one event**. An alert feed that emits
+twenty rows for one problem is an alert feed people learn to ignore.
+
+Spark cannot fix this — a streaming window deliberately has no memory of previous windows, which is
+exactly what lets it scale. Fixing it needs a small piece of memory keyed by route, and that is
+what the API adds. An **episode** opens the first time a route reports trouble, absorbs every
+measurement that agrees, notes if it gets worse, and closes when the route recovers.
+
+Measured live: **17 episodes opened while 70 repeated measurements were absorbed into them.**
+
+Episodes also track worst-so-far separately from right-now, because those answer different
+questions. A dispatcher triaging a list wants to know how bad it got; someone watching one route
+wants to know if it is recovering. The map shows this as `severe bunching → bunching`.
+
+What is available over HTTP:
+
+| Endpoint | What it gives you |
+|---|---|
+| `/api/routes` | every route being measured, worst first |
+| `/api/alerts` | current problems, as events not measurements |
+| `/api/alerts/history` | problems that have since resolved |
+| `/api/vehicles` | where every bus is |
+| `/api/status` | counters that tell you whether the pipeline is healthy |
+| `/ws/live` | a live connection that pushes the whole picture once a second |
+
+### The map
+
+Three files, no framework, no build step. The browser opens one connection and receives a complete
+snapshot every second.
+
+**Snapshots, not changes.** Sending only what changed would be smaller, and it would mean a browser
+that misses one message is subtly wrong until the next full refresh, and reconnecting needs its own
+special path. A complete snapshot has none of those problems: every message stands alone, a dropped
+one costs a second, and connecting is the same code as updating. It is affordable because the whole
+picture is only about 84 KB.
+
+**Two details that matter more than they look:**
+
+*Move the dots, do not recreate them.* 180 buses redrawn once a second is 10,800 objects a minute if
+each update rebuilds them, and it slams shut any popup you are reading mid-sentence. The markers are
+kept and moved.
+
+*Back off when reconnecting.* A server restart is exactly when every open browser tab tries to
+reconnect at once. Retrying in a tight loop turns one restart into a stampede against a process
+that is still starting up.
+
+---
+
+## Things that went wrong
+
+The most useful part of the project. All of these are real, and most were found by running it
+rather than by thinking about it.
+
+### The system was reporting bunching everywhere
+
+Because a 60-second window contains four sightings of the same bus, and nobody had said "only keep
+the newest one per bus". It was measuring the distance between each bus and itself, fifteen seconds
+earlier. Tens of metres. Constant severe bunching, everywhere, permanently.
+
+### Two buses "parked 38 metres apart" on route 89
+
+They were parked. At a depot. Between shifts. The maths was completely right and the answer was
+useless — which is a different kind of bug, and a more interesting one.
+
+### Joining on the obvious field silently matched nothing
+
+The live feed says a bus is on `route_id: "15"`. The timetable file also has a column called
+`route_id`, and for that same route it contains `26913`. The value `15` lives in
+`route_short_name`.
+
+Joining the two `route_id` columns matches **zero rows** — and because it is a left join, nothing
+fails. Every route quietly enriches to null and the pipeline keeps running. Verified both ways: 9
+of 9 sample buses matched on short name, **0 of 9** matched on route id.
+
+### A field that looks standard and is not
+
+The GTFS spec says `direction_id` is 0 or 1 — outbound or inbound. MARTA's live feed contains 5, 9,
+11, 14, 17 and null, and never 0 or 1. Whatever those mean, they are not the standard field.
+
+This matters because headway only makes sense between buses going the *same way*; a northbound and
+a southbound bus passing each other are not consecutive in any useful sense. The real direction
+comes from the timetable instead, where it is clean: 26,549 trips one way, 25,852 the other,
+nothing else.
+
+### The bug the tests caught before it ever ran
+
+The code that filters trips to "services running today" treated an **empty** result as "don't
+filter" rather than "nothing runs today". On a Saturday that would have folded every weekday trip
+back in, halving the apparent scheduled headway and reporting a perfectly spaced fleet as bunched.
+The test failed immediately.
+
+### Spark died and it was the folder's fault
+
+Spark kept crashing with an error claiming two copies of the job were running. There was one. It
+also reported corrupted internal state that nothing had corrupted.
+
+Spark's crash-recovery files assume that renaming a file is instantaneous and atomic. This project
+lives in a OneDrive folder, and OneDrive syncs files out from under whatever is using them. Moving
+those files off the synced folder fixed both errors.
+
+**And then I did something worse:** I fixed it by changing *two* things at once — moving the files
+*and* disabling a Spark safety check I had wrongly blamed. That left no way to know which one
+worked, while paying a real cost: the check I disabled is the one that catches a corrupted restart.
+So I went back and re-ran it with the check switched on. Six clean batches. The check was never the
+problem. It is back on, and the wrong diagnosis is recorded in the code as wrong, because a
+plausible wrong explanation left in a comment is worse than no comment.
+
+### Every handler returned a 500 error
+
+Java's compiler discards the names of method parameters unless you ask it not to. Spring needs
+those names to work out which part of a URL goes into which variable. Spring Boot's standard setup
+turns the option on invisibly; this project deliberately does not use that setup, so it inherited
+the requirement without the fix. Every single web request failed until the flag was added.
+
+### A field was missing from the output and the tests were happy
+
+The API was supposed to send `durationSeconds` — how long a problem had been going on. It never
+appeared. The test passed because it parsed the response back into an object and *recalculated* the
+duration, so it never noticed the field was absent from the actual data.
+
+Found by reading real output. The test now checks the raw text.
+
+### A dependency I never asked for broke a module that never used it
+
+Adding Spring Boot to the project pinned a networking library to an older version — across the
+*whole* build. Spark, in a completely separate module that has never heard of Spring, immediately
+crashed on startup.
+
+> **A shared dependency list is not a suggestion for the module that wants it. It is a constraint on
+> everything that inherits it.**
+
+### The number I got wrong
+
+I claimed 93% of incoming readings were duplicates, reasoning from "11,833 records covering 177
+buses". That conflated *"we have seen this bus before"* with *"this reading is a duplicate"* —
+buses genuinely do move between readings.
+
+Measured properly, it is **51%**: 1,565 stale out of 3,090 processed. Still enough to justify the
+optimisation built on it, but the number I first published was wrong and is corrected everywhere it
+appeared.
+
+---
+
+## Measuring the concurrency claims
+
+Lots of projects assert things about thread safety in comments. This one measures them, with JMH —
+the standard Java benchmarking tool, which runs code in a separate process and handles the ways
+naive timing loops lie to you.
+
+All figures on an 8-core Intel Core Ultra 7, throughput in operations per microsecond, **higher is
+better**.
+
+### Updating shared state
+
+The core operation: many threads, one shared map, "store this reading only if it is newer".
+
+| Approach | 1 thread | 8 threads |
+|---|---:|---:|
+| Unsafe version (**loses data**) | 23.1 | 84.7 |
+| **What this project uses** | 21.6 | **66.0** |
+| Standard atomic update | 22.2 | 54.6 |
+| `StampedLock` | 28.5 | 29.9 |
+| `synchronized` | **32.4** | 14.5 |
+| Read/write lock | 15.4 | 5.1 |
+
+**`synchronized` is the fastest option on one thread and gets *slower* with eight.** 32.4 down to
+14.5, while the atomic version goes *up* to 54.6. A single-threaded benchmark would have confidently
+recommended the thing that collapses under load.
+
+**A read/write lock is the worst correct option at every thread count.** Taking a *read* lock is
+still a write to the lock's own bookkeeping, so readers fight each other over one piece of memory.
+
+**The unsafe version really is faster.** "Correct code costs nothing" would have been a convenient
+result and it is false. The honest argument is that the difference buys you a silently lost update —
+which an earlier test reproduced at 5 runs in 40.
+
+### The optimisation this found
+
+The atomic update takes a lock even when it decides to change nothing — and about half of all
+readings are duplicates that change nothing. So a cheap lock-free check now runs first, and returns
+early only when it can **prove** the reading is not newer. **7.5× faster** on that path.
+
+This is not the unsafe version wearing a disguise, and the distinction is exact: the unsafe
+version's decision is *final*, this one can only skip work. Stored timestamps never move backwards,
+so "not newer than what I just read" stays true no matter what another thread does next. Anything
+else falls through to the locked path that makes the real decision.
+
+### Reading several fields that must agree
+
+Seven readers, one writer, four values that must come from the same update.
+
+| Approach | reads | wrong answers |
+|---|---:|---:|
+| No synchronisation | 672.9 | **6,972,619,214** |
+| `StampedLock` optimistic read | 498.4 | 0 |
+| Immutable snapshot | 449.3 | 0 |
+| `synchronized` | 16.1 | 0 |
+| Read/write lock | 5.8 | 0 |
+
+The unsynchronised version is the fastest by a distance and mismatched its own fields **seven
+billion times**. A benchmark reporting only the speed column would be an argument for shipping a
+bug.
+
+### Two techniques deliberately not used
+
+The plan was to add `StampedLock` and Guava's `Striped` locks. The measurements said don't, and
+following the measurement is the point of taking it.
+
+**`StampedLock`** is genuinely impressive — 86× a read/write lock. But an immutable object behind a
+single reference is within 10% on reads and **twice as fast on writes**, because a reader takes one
+value and then holds something nobody can change. That is already the pattern used throughout this
+project. Adding a lock to match what immutability gives for free would be a downgrade.
+
+**Striped locks** work — 3.3× a single global lock — but only when heavily over-provisioned. With 8
+stripes across 8 threads they are statistically indistinguishable from one global lock. *"Use
+striping"* is not the advice; *"use far more stripes than you have threads"* is. And restructuring
+the data to avoid locking entirely beat every locking variant.
+
+Both are implemented in the benchmark module, where they document the trade-off without imposing
+it.
+
+Run them yourself (takes about 20 minutes):
+
 ```bash
 java -jar headway-bench/target/benchmarks.jar
 ```
 
-JMH, in a forked JVM, 2 forks × 5×2s warmup × 5×2s measurement. Not a hand-rolled timing loop:
-a microbenchmark that measures a value nobody reads gets deleted by the JIT, and one that shares a
-JVM with its launcher inherits that JVM's compilation state. Both failures produce numbers, which
-is what makes them dangerous.
+---
 
-All figures below: Intel Core Ultra 7 258V, 8 logical cores, JDK 21.0.9, Windows 11, throughput in
-**ops/µs, higher is better**. An early run at 1 fork × 3×1s reported errors larger than the scores
-— those numbers are not in this table, because a result of `20.7 ± 93.8` is not a result.
-
-### Keyed read-decide-write — the `VehicleStore.accept` pattern
-
-| implementation | 1 thread | 8 threads, apply | 8 threads, reject stale |
-|---|---:|---:|---:|
-| `get`+`put` (**racy, loses updates**) | 23.1 | 84.7 | 662.6 |
-| **`compute` with a lock-free guard** | 21.6 | **66.0** | **430.3** |
-| `ConcurrentHashMap.compute` | 22.2 | 54.6 | 57.4 |
-| `StampedLock` (pessimistic) | 28.5 | 29.9 | 30.4 |
-| `synchronized` | **32.4** | 14.5 | 15.4 |
-| `ReentrantReadWriteLock` | 15.4 | 5.1 | 6.2 |
-
-Three things fall out of this table, and only one was expected.
-
-**`synchronized` is the fastest option on one thread and the second-worst on eight.** 32.4 → 14.5:
-adding seven threads made it *slower in absolute terms*, while `compute` went 22.2 → 54.6. An
-uncontended `synchronized` block is nearly free — the JIT's thin-lock path — so a single-threaded
-microbenchmark would have "proved" it the winner and shipped a bottleneck.
-
-**A read/write lock is the worst way to do this.** Slower than one `synchronized` block at every
-thread count. Acquiring a *read* lock is still a write to the lock's own state word, so readers
-contend with each other on one cache line; that only pays back when the critical section is long,
-and a map lookup is not.
-
-**The racy version is genuinely much faster, and that is the honest reason to measure.** "Correct
-code is just as fast" would have been a convenient result and it is not true. The right argument is
-that 84.7 versus 66.0 buys a silent lost update — which an earlier step reproduced at 5 runs in 40.
-
-### The optimisation this found
-
-`compute` takes the key's bin lock **even when it decides to change nothing**, and on this feed
-that is the single most common outcome. Measured live:
+## Project layout
 
 ```
-metrics | fetched 3090 -> enqueued 3090 -> processed 3090 (1565 stale, 16 rejected)
-        | queue 0/1024 0% | blocked 0ms | store 172 vehicles on 62 routes
+headway-common     the shared data types and JSON rules
+headway-gtfs       the timetable: routes, trips, route shapes, the geometry
+headway-ingest     reads MARTA, decodes it, publishes to Kafka
+headway-stream     the Spark job that measures gaps
+headway-api        the website and its live data feed
+headway-bench      benchmarks for the concurrency claims above
 ```
 
-**1,565 of 3,090 — about half.** MARTA republishes every bus on every poll whether or not it has
-moved, so half of all traffic is a re-send whose only correct outcome is to be dropped.
+`headway-gtfs` deliberately knows nothing about live vehicles, and `headway-common` deliberately
+knows nothing about Kafka. The Spark module and the web module are kept apart because Spark and
+Spring Boot each drag in large, opinionated, conflicting sets of dependencies — as the Netty
+incident above demonstrated.
 
-So `VehicleStore.apply`, `LiveHeadwayState.accept` and `VehicleState.accept` now do a lock-free
-`get` first, and return early only when it **proves the reading is not newer**. Everything else
-falls through to `compute`, which re-decides under the lock. Measured: **430 vs 57 ops/µs, 7.5×**.
+## Configuration
 
-This is not the check-then-act race the project spent step 2 avoiding, and the distinction is
-exact. A racy decision is *final*; this one can only skip work. The stored timestamp for a key is
-monotonically non-decreasing — the sole writer is that `compute`, and it never replaces a value
-with an older one — so "not newer than what I just read" is a permanent truth, and a concurrent
-write can only make the incoming reading *more* stale. A stale read here costs one unnecessary
-`compute`, never a lost update. That is why the guard is written as "prove it is **not** newer"
-rather than "it is newer": the inverted form would be the race.
+Everything has a working default. The ones worth knowing:
 
-One result is unexplained and left that way: the guard is also faster on the pure-write path
-(66.0 vs 54.6) where it can never short-circuit and pure overhead was expected. The error bars
-(±3.1 and ±5.8) do not overlap, so it is real. It does not change the decision, and a plausible
-story about lock convoys would be a guess.
-
-### Reading four fields that must agree — 7 readers, 1 writer
-
-| implementation | reads ops/µs | torn reads |
-|---|---:|---:|
-| plain fields (**no synchronisation**) | 672.9 | **6,972,619,214** |
-| `StampedLock` optimistic read | 498.4 | 0 |
-| immutable snapshot in an `AtomicReference` | 449.3 | 0 |
-| `synchronized` | 16.1 | 0 |
-| `ReentrantReadWriteLock` | 5.8 | 0 |
-
-Every field derives from one sequence number, so a reader can detect its own tearing. That turns
-"is this safe?" into a counter — and the unsynchronised version, the fastest by a distance,
-mismatched its own fields **seven billion times**. A benchmark reporting only the left column would
-be an argument for shipping a bug.
-
-`StampedLock`'s optimistic read is what it is famous for and it earns it: **86× a read/write lock**,
-because in the common case it never writes to the lock at all. Two rules make it safe and both are
-easy to miss — copy the fields to locals *before* validating, and never traverse a mutable
-structure under an optimistic stamp, because a reader can observe a `HashMap` mid-resize and follow
-a half-written reference. Validation happens after the damage. It is for a handful of fields, not
-for a data structure.
-
-### Two techniques this project deliberately does not use
-
-The roadmap promised `StampedLock` and Guava `Striped` in production code. The measurements say
-don't, and following the measurement is the point of having taken it.
-
-**`StampedLock`**: an immutable record behind one volatile reference is within 10% of it on reads
-(449 vs 498) and **more than twice as fast on writes** (7.66 vs 3.50), because a reader does one
-volatile read and then holds an object nobody can mutate — there is no window to tear in. That is
-already the pattern everywhere here: `VehiclePosition`, `GtfsSnapshot`, `RouteHeadway`. Adding a
-lock to match what immutability gives for free would be a downgrade.
-
-**Guava `Striped`**: for a per-key compound update,
-
-| | ops/µs |
-|---|---:|
-| composite immutable value + `compute` | **39.6** |
-| `Striped` with 512 stripes | 25.9 |
-| `Striped` with 64 stripes | 17.2 |
-| `Striped` with 8 stripes | 8.2 |
-| one `ReentrantLock` | 7.8 |
-
-Striping works — 3.3× a global lock — but only when massively over-provisioned. At 8 stripes on 8
-threads it is statistically indistinguishable from a single global lock (8.16 ± 2.28 vs 7.78 ±
-0.42): collisions are routine, so it becomes a global lock with extra indirection. *"Use striping"*
-is not the advice; *"use far more stripes than threads"* is.
-
-And restructuring beats all of it. Putting both fields in one immutable record and swapping it with
-`compute` is 1.5× the best striping and needs no lock object at all. Nothing in this codebase
-currently needs a per-key compound lock — `AlertTracker` deliberately keeps `remove` and archive as
-separate steps so they cannot deadlock — so `Striped` stays in the benchmark module, where it
-documents the trade-off without imposing it.
-
-> The `Striped` benchmark reads and writes through a `ConcurrentHashMap`, not a `HashMap`. Two
-> threads holding *different* stripes touch the same container with no ordering between them, so
-> stripes give atomicity of the compound operation but do nothing for the container's safety.
-> Getting that backwards is the classic way to misuse the class.
+| Variable | Default | What it does |
+|---|---|---|
+| `HEADWAY_KAFKA_BOOTSTRAP` | `localhost:9092` | Where the queue is |
+| `HEADWAY_QUEUE_CAPACITY` | `256` | Slots per queue shard — set it to `4` to watch backpressure engage |
+| `HEADWAY_STARTING_OFFSETS` | `latest` | `earliest` fills the dashboard instantly from stored history |
 
 ## Troubleshooting
 
-**`Failed to clean project: Failed to delete ...headway-common-0.1.0-SNAPSHOT.jar`**
-A previous run's JVM is still alive and holding the jar. Stopping the terminal does not always stop
-the Java process it launched. Find and kill it:
+**The map is blank for the first minute.** Expected. The system needs to see each bus at least
+twice before it can measure a gap.
 
-```bash
-Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -like "*headway*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-```
+**`Failed to delete ...headway-common-0.1.0-SNAPSHOT.jar`** — a Java process from a previous run is
+still alive and holding the file. Closing the terminal does not always kill it. Use the
+`Stop-Process` command in the shutdown section above.
 
-**`The JAVA_HOME environment variable is not defined correctly`**
-Either `JAVA_HOME` is wrong, or the terminal predates the fix — see [Set JAVA_HOME](#set-java_home).
+**`JAVA_HOME environment variable is not defined correctly`** — either it is not set, or the
+terminal was opened before it was set. Note that it must point at the JDK *folder*, not at
+`bin\java.exe`.
 
-**`Timed out talking to Kafka at localhost:9092`**
-The broker is not up. `docker compose up -d`, then wait for `docker compose ps` to say healthy.
+**`Timed out talking to Kafka at localhost:9092`** — the queue is not up. `docker compose up -d`,
+then wait for `docker compose ps` to say healthy.
 
-## Module layout
-
-```
-headway-parent          the root pom: dependency versions, Java level, module list
-├── headway-common      domain model + the JSON contract (VehiclePosition, Json)
-├── headway-gtfs        the scheduled feed: routes, trips, shapes, projection geometry
-├── headway-ingest      polls GTFS-Realtime, decodes protobuf, publishes to Kafka
-├── headway-stream      Spark job: Kafka -> windowed headways -> Kafka
-├── headway-api         Spring Boot: Kafka -> in-memory state -> REST + WebSocket
-│                       (and src/main/resources/static: the Leaflet map)
-└── headway-bench       JMH benchmarks for the concurrency claims the others make
-```
-
-`headway-gtfs` deliberately does **not** depend on `headway-common`: it knows about the scheduled
-feed and nothing about realtime vehicle positions, so it can be tested and reused on its own. The
-two worlds meet in `headway-ingest`, which depends on both.
-
-`headway-common` deliberately has **no** Kafka dependency. The domain model defines what a vehicle
-position *is* and how it is written as JSON; how those bytes get transported is the ingest module's
-concern, and Spark in step 7 will read the same JSON without going through Kafka's serializer API
-at all.
-
-`headway-stream` and `headway-api` are separate modules on purpose, and step 9 proved why more
-sharply than expected. Spring Boot's BOM was first imported into the *parent* pom so every module
-could see it. That pinned Netty 4.1 across the whole build, and Spark 4.1 — which needs Netty 4.2 —
-died with `NoClassDefFoundError: io/netty/channel/nio/NioIoHandler`. Nothing in the API module was
-involved; the damage was entirely in a sibling that had never heard of Spring. The BOM now lives in
-`headway-api/pom.xml` where it constrains one module. **A BOM is not a suggestion for the module
-that wants it — it is a constraint on everything that inherits it.**
+**Editing the map's files while the site is running does nothing.** They are served from the built
+copy, not from the source folder. Rebuild and restart. Hard-refreshing the browser will not help —
+the server really is sending the old version.
 
 ## Data sources
 
-| Feed | URL | Format |
-|------|-----|--------|
-| Vehicle positions (realtime) | `https://gtfs-rt.itsmarta.com/TMGTFSRealTimeWebService/vehicle/vehiclepositions.pb` | GTFS-RT protobuf |
-| Trip updates (realtime) | `https://gtfs-rt.itsmarta.com/TMGTFSRealTimeWebService/tripupdate/tripupdates.pb` | GTFS-RT protobuf |
-| Static schedule | `https://www.itsmarta.com/google_transit_feed/google_transit.zip` | GTFS (zip of CSVs) |
+| Feed | Format |
+|---|---|
+| [Live vehicle positions](https://gtfs-rt.itsmarta.com/TMGTFSRealTimeWebService/vehicle/vehiclepositions.pb) | GTFS-Realtime protobuf |
+| [Scheduled timetable](https://itsmarta.com/google_transit_feed/google_transit.zip) | GTFS static (zipped CSV) |
 
-The static zip is 21 MB (≈147 MB uncompressed) and is cached under `data/`, which is gitignored.
+No API key needed. Be polite — the poller enforces a hard ceiling of one request per 15 seconds
+regardless of what the rest of the code asks for.
 
-No API key required. Be polite: poll no faster than every 15 seconds (step 2 enforces this with a
-rate limiter).
+Map tiles from [CARTO](https://carto.com/attributions), map data from
+[OpenStreetMap](https://www.openstreetmap.org/copyright) contributors.
 
 ## License
 
-MIT
+MIT. MARTA's data is published under their own terms.
