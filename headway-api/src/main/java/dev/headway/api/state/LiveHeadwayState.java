@@ -47,6 +47,21 @@ public final class LiveHeadwayState {
             return false;
         }
 
+        // Fast path: a lock-free read that can only prove the answer is "too old". compute() takes
+        // the key's bin lock even to decide nothing changes, and late window re-emissions are
+        // common - 156 of them in one live run. Safe for the same reason as the identical guard in
+        // VehicleStore: window ends only ever move forward here, so "not newer than what I just
+        // read" stays true no matter what another thread does next. Anything else falls through to
+        // compute(), which decides under the lock.
+        //
+        // isBefore, not !isAfter: an equal window end is a refinement Spark re-emitted with better
+        // data and must be accepted, so it has to reach compute().
+        RouteHeadway seen = byGroup.get(incoming.headwayGroup());
+        if (seen != null && incoming.windowEnd().isBefore(seen.windowEnd())) {
+            rejectedAsStale.increment();
+            return false;
+        }
+
         // A lambda cannot assign to a local variable, so a one-element array carries the decision
         // out of the compute block. Ugly, but the alternative - deciding outside and writing inside
         // - is exactly the race this method exists to avoid.

@@ -103,6 +103,60 @@ class VehicleStoreTest {
         assertThat(store.snapshot().get("bus-1").timestamp()).isEqualTo(T0.plusSeconds(60));
     }
 
+    /**
+     * The lock-free guard in front of {@code compute} answers STALE without taking the bin lock,
+     * which is worth 7.5x on the path that carries about half of real traffic. These pin the two ways a
+     * shortcut like that goes wrong: answering STALE when it should not, and leaving the store in a
+     * state where the next genuine update is refused.
+     */
+    @Test
+    @DisplayName("the lock-free stale check never blocks a later genuine update")
+    void fastPathDoesNotPoisonTheStore() {
+        assertThat(store.apply(ping("bus-1", "15", T0.plusSeconds(60))))
+                .isEqualTo(VehicleStore.Outcome.NEW);
+
+        // Fifty stale re-sends, every one short-circuited before the lock.
+        for (int i = 0; i < 50; i++) {
+            assertThat(store.apply(ping("bus-1", "15", T0.plusSeconds(i))))
+                    .isEqualTo(VehicleStore.Outcome.STALE);
+        }
+
+        // ...and the store still accepts the next real reading, and still holds the right one.
+        assertThat(store.apply(ping("bus-1", "15", T0.plusSeconds(61))))
+                .isEqualTo(VehicleStore.Outcome.UPDATED);
+        assertThat(store.snapshot().get("bus-1").timestamp()).isEqualTo(T0.plusSeconds(61));
+        assertThat(store.size()).isEqualTo(1);
+    }
+
+    /**
+     * An equal timestamp is <em>not</em> newer, so it must be STALE — the guard uses
+     * "prove it is not newer", and an off-by-one there would let a duplicate through and make
+     * replaying a Kafka topic non-idempotent.
+     */
+    @Test
+    @DisplayName("a reading with an identical timestamp is stale, not an update")
+    void equalTimestampIsStale() {
+        store.apply(ping("bus-1", "15", T0));
+
+        assertThat(store.apply(ping("bus-1", "15", T0))).isEqualTo(VehicleStore.Outcome.STALE);
+        assertThat(store.staleTotal()).isEqualTo(1);
+    }
+
+    /** After eviction the key is gone, so the guard must fall through rather than answer STALE. */
+    @Test
+    @DisplayName("a vehicle re-appearing after eviction is NEW again")
+    void fastPathDoesNotHideAnEvictedVehicle() {
+        TestClock clock = new TestClock(T0);
+        VehicleStore evicting = new VehicleStore(clock, MAX_AGE);
+        evicting.apply(ping("bus-1", "15", T0));
+
+        clock.advance(MAX_AGE.plusMinutes(1));
+        assertThat(evicting.evictStale()).isEqualTo(1);
+
+        assertThat(evicting.apply(ping("bus-1", "15", clock.instant())))
+                .isEqualTo(VehicleStore.Outcome.NEW);
+    }
+
     @Test
     @DisplayName("snapshots are immutable and do not change under later writes")
     void snapshotsAreFrozen() {

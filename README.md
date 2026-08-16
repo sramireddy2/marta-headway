@@ -48,7 +48,7 @@ MARTA GTFS-Realtime  ──poll──▶  Ingest service  ──▶  Kafka  ─�
 | 8 | Bunching / gapping detection + alert topic | ✅ |
 | 9 | Spring Boot REST + WebSocket API | ✅ |
 | 10 | Leaflet live map front-end | ✅ |
-| 11 | Concurrency hardening (StampedLock / Striped locks) + benchmarks | ☐ |
+| 11 | Concurrency benchmarks (JMH) + a measured optimisation | ✅ |
 
 ---
 
@@ -530,6 +530,7 @@ The interesting parts, and where to read them:
 | Concern | Where | Approach |
 |---------|-------|----------|
 | Shared mutable state | [`VehicleStore`](headway-ingest/src/main/java/dev/headway/ingest/VehicleStore.java) | `ConcurrentHashMap.compute` — read-decide-write as one atomic step, avoiding a check-then-act race |
+| Cost of that atomicity | `VehicleStore.apply` | A lock-free `get` that can only prove staleness runs first; `compute` still decides. 7.5× on the path carrying half the traffic |
 | Idempotency / late data | `VehiclePosition.isSupersededBy` | Per-vehicle last-seen timestamp; older readings dropped |
 | Consistent reads | `VehicleStore.snapshot()` | Guava `ImmutableMap` copy, so readers never see a half-applied batch |
 | Contended counters | `VehicleStore` | `LongAdder`, not `AtomicLong` |
@@ -547,6 +548,8 @@ The interesting parts, and where to read them:
 
 The concurrency test in `VehicleStoreTest` is not decorative: the same workload run against a
 naive `get()`-then-`put()` implementation served a stale position on 5 of 40 runs.
+
+Every claim in that table is measured in [The benchmarks](#the-benchmarks-step-11).
 
 ## The Spark streaming job
 
@@ -995,6 +998,140 @@ Seen          28s ago
 
 That is the same bus, the whole pipeline, and the entire point of the project in one popup.
 
+## The benchmarks (step 11)
+
+```bash
+.\mvnw.cmd -q -pl headway-bench -am package -DskipTests
+```
+```bash
+java -jar headway-bench/target/benchmarks.jar
+```
+
+JMH, in a forked JVM, 2 forks × 5×2s warmup × 5×2s measurement. Not a hand-rolled timing loop:
+a microbenchmark that measures a value nobody reads gets deleted by the JIT, and one that shares a
+JVM with its launcher inherits that JVM's compilation state. Both failures produce numbers, which
+is what makes them dangerous.
+
+All figures below: Intel Core Ultra 7 258V, 8 logical cores, JDK 21.0.9, Windows 11, throughput in
+**ops/µs, higher is better**. An early run at 1 fork × 3×1s reported errors larger than the scores
+— those numbers are not in this table, because a result of `20.7 ± 93.8` is not a result.
+
+### Keyed read-decide-write — the `VehicleStore.accept` pattern
+
+| implementation | 1 thread | 8 threads, apply | 8 threads, reject stale |
+|---|---:|---:|---:|
+| `get`+`put` (**racy, loses updates**) | 23.1 | 84.7 | 662.6 |
+| **`compute` with a lock-free guard** | 21.6 | **66.0** | **430.3** |
+| `ConcurrentHashMap.compute` | 22.2 | 54.6 | 57.4 |
+| `StampedLock` (pessimistic) | 28.5 | 29.9 | 30.4 |
+| `synchronized` | **32.4** | 14.5 | 15.4 |
+| `ReentrantReadWriteLock` | 15.4 | 5.1 | 6.2 |
+
+Three things fall out of this table, and only one was expected.
+
+**`synchronized` is the fastest option on one thread and the second-worst on eight.** 32.4 → 14.5:
+adding seven threads made it *slower in absolute terms*, while `compute` went 22.2 → 54.6. An
+uncontended `synchronized` block is nearly free — the JIT's thin-lock path — so a single-threaded
+microbenchmark would have "proved" it the winner and shipped a bottleneck.
+
+**A read/write lock is the worst way to do this.** Slower than one `synchronized` block at every
+thread count. Acquiring a *read* lock is still a write to the lock's own state word, so readers
+contend with each other on one cache line; that only pays back when the critical section is long,
+and a map lookup is not.
+
+**The racy version is genuinely much faster, and that is the honest reason to measure.** "Correct
+code is just as fast" would have been a convenient result and it is not true. The right argument is
+that 84.7 versus 66.0 buys a silent lost update — which an earlier step reproduced at 5 runs in 40.
+
+### The optimisation this found
+
+`compute` takes the key's bin lock **even when it decides to change nothing**, and on this feed
+that is the single most common outcome. Measured live:
+
+```
+metrics | fetched 3090 -> enqueued 3090 -> processed 3090 (1565 stale, 16 rejected)
+        | queue 0/1024 0% | blocked 0ms | store 172 vehicles on 62 routes
+```
+
+**1,565 of 3,090 — about half.** MARTA republishes every bus on every poll whether or not it has
+moved, so half of all traffic is a re-send whose only correct outcome is to be dropped.
+
+So `VehicleStore.apply`, `LiveHeadwayState.accept` and `VehicleState.accept` now do a lock-free
+`get` first, and return early only when it **proves the reading is not newer**. Everything else
+falls through to `compute`, which re-decides under the lock. Measured: **430 vs 57 ops/µs, 7.5×**.
+
+This is not the check-then-act race the project spent step 2 avoiding, and the distinction is
+exact. A racy decision is *final*; this one can only skip work. The stored timestamp for a key is
+monotonically non-decreasing — the sole writer is that `compute`, and it never replaces a value
+with an older one — so "not newer than what I just read" is a permanent truth, and a concurrent
+write can only make the incoming reading *more* stale. A stale read here costs one unnecessary
+`compute`, never a lost update. That is why the guard is written as "prove it is **not** newer"
+rather than "it is newer": the inverted form would be the race.
+
+One result is unexplained and left that way: the guard is also faster on the pure-write path
+(66.0 vs 54.6) where it can never short-circuit and pure overhead was expected. The error bars
+(±3.1 and ±5.8) do not overlap, so it is real. It does not change the decision, and a plausible
+story about lock convoys would be a guess.
+
+### Reading four fields that must agree — 7 readers, 1 writer
+
+| implementation | reads ops/µs | torn reads |
+|---|---:|---:|
+| plain fields (**no synchronisation**) | 672.9 | **6,972,619,214** |
+| `StampedLock` optimistic read | 498.4 | 0 |
+| immutable snapshot in an `AtomicReference` | 449.3 | 0 |
+| `synchronized` | 16.1 | 0 |
+| `ReentrantReadWriteLock` | 5.8 | 0 |
+
+Every field derives from one sequence number, so a reader can detect its own tearing. That turns
+"is this safe?" into a counter — and the unsynchronised version, the fastest by a distance,
+mismatched its own fields **seven billion times**. A benchmark reporting only the left column would
+be an argument for shipping a bug.
+
+`StampedLock`'s optimistic read is what it is famous for and it earns it: **86× a read/write lock**,
+because in the common case it never writes to the lock at all. Two rules make it safe and both are
+easy to miss — copy the fields to locals *before* validating, and never traverse a mutable
+structure under an optimistic stamp, because a reader can observe a `HashMap` mid-resize and follow
+a half-written reference. Validation happens after the damage. It is for a handful of fields, not
+for a data structure.
+
+### Two techniques this project deliberately does not use
+
+The roadmap promised `StampedLock` and Guava `Striped` in production code. The measurements say
+don't, and following the measurement is the point of having taken it.
+
+**`StampedLock`**: an immutable record behind one volatile reference is within 10% of it on reads
+(449 vs 498) and **more than twice as fast on writes** (7.66 vs 3.50), because a reader does one
+volatile read and then holds an object nobody can mutate — there is no window to tear in. That is
+already the pattern everywhere here: `VehiclePosition`, `GtfsSnapshot`, `RouteHeadway`. Adding a
+lock to match what immutability gives for free would be a downgrade.
+
+**Guava `Striped`**: for a per-key compound update,
+
+| | ops/µs |
+|---|---:|
+| composite immutable value + `compute` | **39.6** |
+| `Striped` with 512 stripes | 25.9 |
+| `Striped` with 64 stripes | 17.2 |
+| `Striped` with 8 stripes | 8.2 |
+| one `ReentrantLock` | 7.8 |
+
+Striping works — 3.3× a global lock — but only when massively over-provisioned. At 8 stripes on 8
+threads it is statistically indistinguishable from a single global lock (8.16 ± 2.28 vs 7.78 ±
+0.42): collisions are routine, so it becomes a global lock with extra indirection. *"Use striping"*
+is not the advice; *"use far more stripes than threads"* is.
+
+And restructuring beats all of it. Putting both fields in one immutable record and swapping it with
+`compute` is 1.5× the best striping and needs no lock object at all. Nothing in this codebase
+currently needs a per-key compound lock — `AlertTracker` deliberately keeps `remove` and archive as
+separate steps so they cannot deadlock — so `Striped` stays in the benchmark module, where it
+documents the trade-off without imposing it.
+
+> The `Striped` benchmark reads and writes through a `ConcurrentHashMap`, not a `HashMap`. Two
+> threads holding *different* stripes touch the same container with no ordering between them, so
+> stripes give atomicity of the compound operation but do nothing for the container's safety.
+> Getting that backwards is the classic way to misuse the class.
+
 ## Troubleshooting
 
 **`Failed to clean project: Failed to delete ...headway-common-0.1.0-SNAPSHOT.jar`**
@@ -1019,8 +1156,9 @@ headway-parent          the root pom: dependency versions, Java level, module li
 ├── headway-gtfs        the scheduled feed: routes, trips, shapes, projection geometry
 ├── headway-ingest      polls GTFS-Realtime, decodes protobuf, publishes to Kafka
 ├── headway-stream      Spark job: Kafka -> windowed headways -> Kafka
-└── headway-api         Spring Boot: Kafka -> in-memory state -> REST + WebSocket
-                        (and src/main/resources/static: the Leaflet map)
+├── headway-api         Spring Boot: Kafka -> in-memory state -> REST + WebSocket
+│                       (and src/main/resources/static: the Leaflet map)
+└── headway-bench       JMH benchmarks for the concurrency claims the others make
 ```
 
 `headway-gtfs` deliberately does **not** depend on `headway-common`: it knows about the scheduled

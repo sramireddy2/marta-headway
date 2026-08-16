@@ -140,6 +140,32 @@ public final class VehicleStore {
             return Outcome.REJECTED;
         }
 
+        // Fast path: a lock-free read that can only ever prove the answer is STALE.
+        //
+        // compute() takes the key's bin lock even when it decides to do nothing, and doing nothing
+        // is the single most common outcome here. Measured live: 3,090 pings processed, 1,565 of
+        // them stale - about half, because the feed republishes every bus on every poll whether or
+        // not it has moved. Skipping the lock on that path is worth 7.5x at 8 threads, 430 ops/us
+        // against 57 (see headway-bench).
+        //
+        // WHY THIS IS NOT THE CHECK-THEN-ACT RACE THIS CLASS EXISTS TO AVOID.
+        //
+        // The difference is that a racy decision is *final* and this one is only a hint that can
+        // skip work. The guard is deliberately written as "prove it is NOT newer", never "it is
+        // newer": if the read says the stored reading is at least as new, that conclusion is
+        // permanent, because the only writer is the compute() below and it never replaces a value
+        // with an older one. The stored timestamp for a key is monotonically non-decreasing, so a
+        // concurrent write can only make `incoming` more stale, never less.
+        //
+        // Every other outcome falls through to compute(), which re-reads under the bin lock and
+        // makes the real decision. A stale read here therefore costs one unnecessary compute() -
+        // never a lost update.
+        VehiclePosition seen = byVehicleId.get(incoming.vehicleId());
+        if (seen != null && !seen.isSupersededBy(incoming)) {
+            staleCount.increment();
+            return Outcome.STALE;
+        }
+
         // We need to know which branch the lambda took. AtomicReference is the carrier.
         // This is safe specifically because compute() runs the function exactly once, under the
         // bin lock — it never retries it the way a compare-and-swap loop would.

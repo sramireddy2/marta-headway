@@ -33,6 +33,15 @@ public final class VehicleState {
         if (incoming == null) {
             return false;
         }
+        // Same lock-free guard as VehicleStore.apply, for the same reason and with the same
+        // correctness argument: it can only prove staleness, and stored timestamps never go
+        // backwards, so the conclusion cannot be invalidated by a concurrent write.
+        VehiclePosition seen = byVehicle.get(incoming.vehicleId());
+        if (seen != null && !seen.isSupersededBy(incoming)) {
+            ignoredAsOld.increment();
+            return false;
+        }
+
         boolean[] took = {false};
         byVehicle.compute(incoming.vehicleId(), (id, existing) -> {
             if (existing != null && !existing.isSupersededBy(incoming)) {

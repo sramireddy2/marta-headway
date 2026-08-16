@@ -25,6 +25,10 @@ desktop.ini
 logs/
 /data/
 
+# JMH raw output. The numbers worth keeping are transcribed into the README with the machine
+# they came from; a results file with no hardware attached to it is not evidence of anything.
+headway-bench/results.json
+
 # Secrets — never commit these
 .env
 *.local.properties
