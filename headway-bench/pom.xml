@@ -74,6 +74,12 @@
             </goals>
             <configuration>
               <finalName>benchmarks</finalName>
+              <!--
+                Off, as in headway-stream. Shade otherwise writes a dependency-reduced-pom.xml into
+                the module root - a generated file that looks hand-written and lands in a commit the
+                first time someone runs `git add -A`, which is exactly how it got in here once.
+              -->
+              <createDependencyReducedPom>false</createDependencyReducedPom>
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                   <mainClass>org.openjdk.jmh.Main</mainClass>

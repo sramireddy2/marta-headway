@@ -1,5 +1,8 @@
 # Maven build output
 target/
+# Written by maven-shade-plugin into the module root, not into target/. Both shading modules
+# disable it; this is the belt to that pair of braces.
+dependency-reduced-pom.xml
 
 # Maven wrapper: the scripts and .properties ARE committed on purpose (that is the
 # whole point of a wrapper), but the downloaded distribution is not.
