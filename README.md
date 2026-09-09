@@ -4,7 +4,7 @@
 
 **Watches Atlanta's buses in real time and spots when they bunch up.**
 
-If a bus is supposed to come every 10 minutes, you should never wait 25 and then see three arrive together. Headway reads MARTA's live feed, measures how far apart the buses actually are, compares that to the timetable, and paints the problem on a map as it happens.
+If a bus is scheduled every 10 minutes, you shouldn't wait 25 just to watch three pull up together. Headway taps into MARTA's live feed to measure the actual gaps between buses, compares them against the timetable, and instantly paints the problem on a map as it unfolds.
 
 <br/>
 
