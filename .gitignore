@@ -35,3 +35,6 @@ headway-bench/results.json
 # Secrets — never commit these
 .env
 *.local.properties
+
+# Local editor / agent settings
+.claude/
